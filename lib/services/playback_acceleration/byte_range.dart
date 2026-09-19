@@ -13,11 +13,11 @@ final class ByteRange {
   static ByteRange parseHeader(String value) {
     final match = RegExp(r'^bytes=(\d+)-(\d+)$').firstMatch(value.trim());
     if (match == null) {
-      throw FormatException('Expected one closed byte range');
+      throw const FormatException('Expected one closed byte range');
     }
     final start = int.parse(match.group(1)!);
     final end = int.parse(match.group(2)!);
-    if (end < start) throw FormatException('Range end precedes start');
+    if (end < start) throw const FormatException('Range end precedes start');
     return ByteRange(start, end);
   }
 
@@ -46,12 +46,12 @@ final class ContentByteRange {
     final match = RegExp(
       r'^bytes (\d+)-(\d+)/(\d+)$',
     ).firstMatch(value.trim());
-    if (match == null) throw FormatException('Invalid Content-Range');
+    if (match == null) throw const FormatException('Invalid Content-Range');
     final start = int.parse(match.group(1)!);
     final end = int.parse(match.group(2)!);
     final total = int.parse(match.group(3)!);
     if (end < start || total <= end) {
-      throw FormatException('Impossible Content-Range');
+      throw const FormatException('Impossible Content-Range');
     }
     return ContentByteRange(start, end, total);
   }
