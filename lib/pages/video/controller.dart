@@ -61,6 +61,7 @@ import 'package:PiliPlus/utils/extension/num_ext.dart';
 import 'package:PiliPlus/utils/extension/size_ext.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
+import 'package:PiliPlus/utils/playback_route_session.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/theme_utils.dart';
@@ -133,6 +134,7 @@ class VideoDetailController extends GetxController
   late VideoItem firstVideo;
   String? videoUrl;
   String? audioUrl;
+  PlaybackRouteSession? _playbackRoutes;
   Duration? defaultST;
   Duration? playedTime;
   String playedTimePos(bool hasParams) {
@@ -170,6 +172,16 @@ class VideoDetailController extends GetxController
   late final RxInt seasonIndex = 0.obs;
 
   PlayerStatus? playerStatus;
+
+  Worker? _stallWorker;
+  Worker? _networkErrorWorker;
+  Timer? _stallTimer;
+  bool _isStallReloading = false;
+  bool _stallRecoveryExhausted = false;
+  int? _stallPositionSnapshot;
+  int? _stallBufferSnapshot;
+  static const _stallGrace = Duration(milliseconds: 2500);
+  static const _stallRetry = Duration(milliseconds: 5000);
 
   late final scrollKey = GlobalKey<ExtendedNestedScrollViewState>();
   late final RxBool isVertical;
@@ -392,6 +404,121 @@ class VideoDetailController extends GetxController
       vsync: this,
       initialIndex: Pref.defaultShowComment ? 1 : 0,
     );
+
+    if (!isFileSource && Pref.cdnStallRecovery) {
+      _stallWorker = ever(plPlayerController.isBuffering, _onBufferingChange);
+      _networkErrorWorker = ever(
+        plPlayerController.networkOpenFailures,
+        (_) => unawaited(_onNetworkOpenFailure()),
+      );
+    }
+  }
+
+  void _onBufferingChange(bool buffering) {
+    if (_isStallReloading) return;
+    _stallTimer?.cancel();
+    _stallTimer = null;
+    if (!buffering) {
+      _stallPositionSnapshot = null;
+      _stallBufferSnapshot = null;
+    } else if (!_stallRecoveryExhausted) {
+      _captureStallProgress();
+      _stallTimer = Timer(_stallGrace, _handleStall);
+    }
+  }
+
+  void _captureStallProgress() {
+    _stallPositionSnapshot =
+        plPlayerController.videoPlayerController?.state.position.inMilliseconds;
+    _stallBufferSnapshot = plPlayerController.buffered.value;
+  }
+
+  bool get _stallMadeProgress {
+    final oldPosition = _stallPositionSnapshot;
+    final oldBuffer = _stallBufferSnapshot;
+    final position =
+        plPlayerController.videoPlayerController?.state.position.inMilliseconds;
+    final buffer = plPlayerController.buffered.value;
+    return (oldPosition != null &&
+            position != null &&
+            position - oldPosition >= 500) ||
+        (oldBuffer != null && buffer - oldBuffer >= 2);
+  }
+
+  Future<void> _handleStall() async {
+    _stallTimer = null;
+    if (isClosed ||
+        !plPlayerController.isBuffering.value ||
+        plPlayerController.cid != cid.value ||
+        !plPlayerController.playerStatus.isPlaying) {
+      return;
+    }
+    if (isQuerying) {
+      _stallTimer = Timer(_stallRetry, _handleStall);
+      return;
+    }
+    if (_stallMadeProgress) {
+      _captureStallProgress();
+      _stallTimer = Timer(_stallGrace, _handleStall);
+      return;
+    }
+    await _switchToNextVideoRoute();
+  }
+
+  Future<void> _onNetworkOpenFailure() async {
+    if (isClosed ||
+        _isStallReloading ||
+        isQuerying ||
+        plPlayerController.cid != cid.value) {
+      return;
+    }
+    _stallTimer?.cancel();
+    _stallTimer = null;
+    await _switchToNextVideoRoute();
+  }
+
+  Future<void> _switchToNextVideoRoute() async {
+    if (_isStallReloading) return;
+    final routes = _playbackRoutes;
+    if (routes == null) return;
+    final next = routes.nextVideo();
+    if (next == null) {
+      _stallRecoveryExhausted = true;
+      SmartDialog.showToast('可用 CDN 已全部尝试，已停止自动切换');
+      return;
+    }
+    playedTime = plPlayerController.videoPlayerController?.state.position;
+    videoUrl = next;
+    SmartDialog.showToast('播放卡顿，切换 CDN：${Uri.parse(next).host}');
+    _isStallReloading = true;
+    try {
+      await playerInit();
+    } finally {
+      _isStallReloading = false;
+      if (!isClosed &&
+          plPlayerController.isBuffering.value &&
+          plPlayerController.cid == cid.value &&
+          plPlayerController.playerStatus.isPlaying) {
+        _captureStallProgress();
+        _stallTimer = Timer(_stallRetry, _handleStall);
+      }
+    }
+  }
+
+  void _setPlaybackRoutes({
+    required Iterable<String> videoUrls,
+    Iterable<String> audioUrls = const [],
+  }) {
+    final routes = VideoUtils.createPlaybackRouteSession(
+      videoUrls: videoUrls,
+      audioUrls: audioUrls,
+    );
+    _playbackRoutes = routes;
+    videoUrl = routes.videoUrl;
+    audioUrl = routes.audioUrl ?? '';
+    _stallRecoveryExhausted = false;
+    _stallPositionSnapshot = null;
+    _stallBufferSnapshot = null;
   }
 
   Future<void> getMediaList({
@@ -691,7 +818,7 @@ class VideoDetailController extends GetxController
       ..buffered.value = 0;
 
     firstVideo = findVideoByQa(currentVideoQa.code, setCodecs: true);
-    videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
+    Iterable<String> audioUrls = const [];
 
     /// 根据currentAudioQa 重新设置audioUrl
     if (currentAudioQa != null) {
@@ -699,8 +826,10 @@ class VideoDetailController extends GetxController
         (i) => i.id == currentAudioQa!.code,
         orElse: () => data.dash!.audio!.first,
       );
-      audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
+      audioUrls = firstAudio.playUrls;
     }
+
+    _setPlaybackRoutes(videoUrls: firstVideo.playUrls, audioUrls: audioUrls);
 
     playerInit();
   }
@@ -960,8 +1089,6 @@ class VideoDetailController extends GetxController
       );
       _setVideoHeight();
 
-      videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
-
       /// 优先顺序 设置中指定质量 -> 当前可选的最高质量
       AudioItem? firstAudio;
       final audioList = data.dash?.audio;
@@ -979,11 +1106,12 @@ class VideoDetailController extends GetxController
           (e) => e.id == closestNumber,
           orElse: () => audioList.first,
         );
-        audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
         currentAudioQa = AudioQuality.fromCode(firstAudio.id);
-      } else {
-        audioUrl = '';
       }
+      _setPlaybackRoutes(
+        videoUrls: firstVideo.playUrls,
+        audioUrls: firstAudio?.playUrls ?? const [],
+      );
       await _initPlayerIfNeeded(autoFullScreenFlag);
     } else {
       _autoPlay.value = false;
@@ -1246,6 +1374,9 @@ class VideoDetailController extends GetxController
 
   @override
   void onClose() {
+    _stallTimer?.cancel();
+    _stallWorker?.dispose();
+    _networkErrorWorker?.dispose();
     cid.close();
     if (isFileSource) {
       cacheLocalProgress();
@@ -1271,6 +1402,8 @@ class VideoDetailController extends GetxController
     defaultST = null;
     videoUrl = null;
     audioUrl = null;
+    _playbackRoutes = null;
+    _stallRecoveryExhausted = false;
 
     // danmaku
     savedDanmaku = null;

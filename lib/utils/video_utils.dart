@@ -2,6 +2,7 @@ import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models_new/live/live_room_play_info/codec.dart';
 import 'package:PiliPlus/utils/extension/iterable_ext.dart';
+import 'package:PiliPlus/utils/playback_route_session.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 
@@ -9,6 +10,15 @@ abstract final class VideoUtils {
   static CDNService cdnService = Pref.defaultCDNService;
   static String? liveCdnUrl = Pref.liveCdnUrl;
   static bool disableAudioCDN = Pref.disableAudioCDN;
+
+  static final Set<String> _rewriteHostAllowlist = CDNService.values
+      .map((service) => service.host)
+      .whereType<String>()
+      .where(
+        (host) => host.startsWith('upos-') && host.endsWith('.bilivideo.com'),
+      )
+      .map((host) => host.toLowerCase())
+      .toSet();
 
   static const _proxyTf = 'proxy-tf-all-ws.bilivideo.com';
 
@@ -88,6 +98,23 @@ abstract final class VideoUtils {
         : Uri.parse(mcdnUpgcxcode)
               .replace(host: defaultCDNService.host ?? CDNService.ali.host)
               .toString();
+  }
+
+  static PlaybackRouteSession createPlaybackRouteSession({
+    required Iterable<String> videoUrls,
+    Iterable<String> audioUrls = const [],
+  }) {
+    final preferredHost = switch (cdnService) {
+      CDNService.baseUrl || CDNService.backupUrl => null,
+      final service => service.host,
+    };
+    return PlaybackRouteSession(
+      videoUrls: videoUrls,
+      audioUrls: audioUrls,
+      preferredVideoHost: preferredHost,
+      preferredAudioHost: disableAudioCDN ? null : preferredHost,
+      rewriteHostAllowlist: _rewriteHostAllowlist,
+    );
   }
 
   static String getLiveCdnUrl(CodecItem e, {int index = 0}) {

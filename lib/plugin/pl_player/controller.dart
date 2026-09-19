@@ -146,6 +146,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   late final tryLook = !Accounts.get(AccountType.video).isLogin && Pref.p1080;
 
   late DataSource dataSource;
+  String? _networkRetrySource;
+  bool _networkOpenRetryUsed = false;
+  final RxInt networkOpenFailures = 0.obs;
 
   Timer? _timer;
   StreamSubscription? _subForSeek;
@@ -610,6 +613,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       _videoType = videoType ?? VideoType.ugc;
       this.width = width;
       this.height = height;
+      if (dataSource case NetworkSource(:final videoSource)
+          when videoSource != _networkRetrySource) {
+        _networkRetrySource = videoSource;
+        _networkOpenRetryUsed = false;
+      }
       this.dataSource = dataSource;
       _autoPlay = autoplay;
       // 初始化视频倍速
@@ -1015,6 +1023,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
             //tcp: ffurl_read returned 0xdfb9b0bb
             //tcp: ffurl_read returned 0xffffff99
             event.startsWith('tcp: ffurl_read returned ')) {
+          if (_networkOpenRetryUsed) {
+            networkOpenFailures.value++;
+            return;
+          }
+          _networkOpenRetryUsed = true;
           EasyThrottle.throttle(
             'controllerStream.error.listen',
             const Duration(milliseconds: 10000),

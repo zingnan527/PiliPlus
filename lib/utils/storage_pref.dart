@@ -444,6 +444,9 @@ abstract final class Pref {
   static bool get cdnSpeedTest =>
       _setting.get(SettingBoxKey.cdnSpeedTest, defaultValue: true);
 
+  static bool get cdnStallRecovery =>
+      _setting.get(SettingBoxKey.cdnStallRecovery, defaultValue: true);
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 
