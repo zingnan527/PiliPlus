@@ -7,6 +7,7 @@ import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/models/common/video/video_type.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
+import 'package:PiliPlus/services/playback_acceleration/route_probe_service.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:dio/dio.dart';
@@ -87,11 +88,13 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   late final List<ValueNotifier<String?>> _cdnResList;
   late final List<CancelToken?> _tokens;
   late final bool _cdnSpeedTest;
+  late final ProbeCancellation _probeCancellation;
 
   @override
   void initState() {
     _cdnSpeedTest = Pref.cdnSpeedTest;
     if (_cdnSpeedTest) {
+      _probeCancellation = ProbeCancellation();
       _dio =
           Dio(
               BaseOptions(
@@ -117,6 +120,7 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   @override
   void dispose() {
     if (_cdnSpeedTest) {
+      _probeCancellation.cancel();
       for (final e in _tokens) {
         e?.cancel();
       }
@@ -151,29 +155,45 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   }
 
   Future<void> _testAllCdnServices(BaseItem videoItem) async {
-    for (final item in CDNService.values) {
-      if (!mounted) break;
-      await _testSingleCdn(item, videoItem);
-    }
+    final service = RouteProbeService<CDNService>(
+      maxConcurrency: 4,
+      probe: (item, cancellation) async {
+        cancellation.throwIfCancelled();
+        if (!mounted) throw const ProbeCancelled();
+        final sample = await _testSingleCdn(item, videoItem);
+        cancellation.throwIfCancelled();
+        return sample;
+      },
+    );
+    await service.probeAll(
+      CDNService.values,
+      cancellation: _probeCancellation,
+    );
   }
 
-  Future<void> _testSingleCdn(CDNService item, BaseItem videoItem) async {
+  Future<RouteProbeSample> _testSingleCdn(
+    CDNService item,
+    BaseItem videoItem,
+  ) async {
     try {
       final cdnUrl = VideoUtils.getCdnUrl(
         videoItem.playUrls,
         defaultCDNService: item,
       );
-      await _measureDownloadSpeed(cdnUrl, item.index);
+      return await _measureDownloadSpeed(cdnUrl, item.index);
     } catch (e) {
       _handleSpeedTestError(e, item.index);
+      rethrow;
     }
   }
 
   late final Dio _dio;
 
-  Future<void> _measureDownloadSpeed(String url, int index) async {
+  Future<RouteProbeSample> _measureDownloadSpeed(String url, int index) async {
     const maxSize = 8 * 1024 * 1024;
     int downloaded = 0;
+    int? firstProgress;
+    RouteProbeSample? completedSample;
 
     final cancelToken = _tokens[index];
     final start = DateTime.now().microsecondsSinceEpoch;
@@ -183,33 +203,48 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
       _tokens[index] = null;
     }
 
-    await _dio.get(
-      url,
-      cancelToken: cancelToken,
-      onReceiveProgress: (count, total) {
-        if (!mounted) {
-          return;
-        }
+    RouteProbeSample finish(int duration) {
+      final sample = RouteProbeSample(
+        bytes: downloaded,
+        ttfb: Duration(microseconds: (firstProgress ?? start) - start),
+        elapsed: Duration(microseconds: duration),
+      );
+      _updateSpeedResult(index, downloaded, duration);
+      completedSample = sample;
+      return sample;
+    }
 
-        final duration = DateTime.now().microsecondsSinceEpoch - start;
+    try {
+      await _dio.get(
+        url,
+        cancelToken: cancelToken,
+        onReceiveProgress: (count, total) {
+          if (!mounted) return;
 
-        downloaded = count;
+          final now = DateTime.now().microsecondsSinceEpoch;
+          firstProgress ??= now;
+          final duration = now - start;
+          downloaded = count;
 
-        if (duration > 15000000) {
-          onClose();
-          if (downloaded > 0) {
-            _updateSpeedResult(index, downloaded, duration);
-            downloaded = 0;
-          } else {
-            throw TimeoutException('测速超时');
+          if (duration > 15000000) {
+            onClose();
+            if (downloaded > 0) {
+              finish(duration);
+            } else {
+              throw TimeoutException('测速超时');
+            }
+          } else if (downloaded >= maxSize) {
+            finish(duration);
+            onClose();
           }
-        } else if (downloaded >= maxSize) {
-          onClose();
-          _updateSpeedResult(index, downloaded, duration);
-          downloaded = 0;
-        }
-      },
-    );
+        },
+      );
+    } on DioException catch (error) {
+      if (completedSample == null || !CancelToken.isCancel(error)) rethrow;
+    }
+    if (completedSample case final sample?) return sample;
+    if (downloaded <= 0) throw TimeoutException('测速未返回数据');
+    return finish(DateTime.now().microsecondsSinceEpoch - start);
   }
 
   void _updateSpeedResult(int index, int downloaded, int duration) {
