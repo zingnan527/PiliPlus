@@ -30,6 +30,11 @@ void main() {
     await origin.close();
   });
 
+  test('uses conservative per-track concurrency defaults', () {
+    expect(recommendedRangeProxyConcurrency(isWifi: true), 4);
+    expect(recommendedRangeProxyConcurrency(isWifi: false), 2);
+  });
+
   test(
     'uses an opaque loopback token and streams valid bytes in order',
     () async {
@@ -70,6 +75,31 @@ void main() {
       expect(origin.requestedRanges, hasLength(4));
     },
   );
+
+  test('resolves an open range against the validated upstream total', () async {
+    final handle = proxy.createSession(
+      upstream: origin.uriFor(FakeRangeMode.correct206),
+      trackType: ProxyTrackType.video,
+      maxConcurrency: 4,
+    );
+
+    final client = HttpClient();
+    final request = await client.getUrl(handle.localUri);
+    request.headers.set(HttpHeaders.rangeHeader, 'bytes=4096-');
+    final response = await request.close();
+    final body = await response.fold<List<int>>(<int>[], (bytes, chunk) {
+      bytes.addAll(chunk);
+      return bytes;
+    });
+    client.close(force: true);
+
+    expect(response.statusCode, HttpStatus.partialContent);
+    expect(
+      response.headers.value(HttpHeaders.contentRangeHeader),
+      'bytes 4096-16383/16384',
+    );
+    expect(body, origin.payload.sublist(4096));
+  });
 
   test(
     'rejects unknown tokens and never accepts an upstream URL parameter',
@@ -167,6 +197,7 @@ void main() {
     expect(failures, hasLength(1));
     expect(failures.single.sessionId, handle.sessionId);
     expect(failures.single.trackType, ProxyTrackType.video);
+    expect(failures.single.reason, 'expected 206, got 403');
   });
 
   test('closing a session makes its token unusable', () async {
