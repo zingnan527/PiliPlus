@@ -8,11 +8,18 @@ import 'package:PiliPlus/services/playback_acceleration/range_fetcher.dart';
 
 enum ProxyTrackType { video, audio }
 
+int recommendedRangeProxyConcurrency({required bool isWifi}) => isWifi ? 4 : 2;
+
 final class ProxyFailure {
   final String sessionId;
   final ProxyTrackType trackType;
+  final String reason;
 
-  const ProxyFailure({required this.sessionId, required this.trackType});
+  const ProxyFailure({
+    required this.sessionId,
+    required this.trackType,
+    required this.reason,
+  });
 }
 
 final class ProxyMediaHandle {
@@ -173,9 +180,39 @@ final class LoopbackRangeProxy {
     try {
       requestedRange = ByteRange.parseHeader(rawRange);
     } on FormatException {
-      response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
-      await response.close();
-      return;
+      final openRange = RegExp(
+        r'^bytes=(\d+)-$',
+      ).firstMatch(rawRange.trim());
+      if (openRange == null) {
+        response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+        await response.close();
+        return;
+      }
+      final start = int.parse(openRange.group(1)!);
+      var total = session.expectedTotal;
+      if (total == null) {
+        final client = session.openClient();
+        try {
+          final probe = await _fetch(client, session, const ByteRange(0, 0));
+          total = probe.total;
+          session.expectedTotal = total;
+        } catch (error) {
+          session.notifyFailure(error);
+          response
+            ..statusCode = HttpStatus.badGateway
+            ..contentLength = 0;
+          await response.close();
+          return;
+        } finally {
+          session.releaseClient(client);
+        }
+      }
+      if (start >= total) {
+        response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+        await response.close();
+        return;
+      }
+      requestedRange = ByteRange(start, total - 1);
     }
 
     if (request.method == 'HEAD') {
@@ -207,8 +244,8 @@ final class LoopbackRangeProxy {
         )
         ..contentLength = requestedRange.length;
       await response.close();
-    } catch (_) {
-      session.notifyFailure();
+    } catch (error) {
+      session.notifyFailure(error);
       response
         ..statusCode = HttpStatus.badGateway
         ..contentLength = 0;
@@ -273,9 +310,9 @@ final class LoopbackRangeProxy {
         fillWindow();
       }
       await response.close();
-    } catch (_) {
+    } catch (error) {
       client.close(force: true);
-      session.notifyFailure();
+      session.notifyFailure(error);
       if (!headersSent) {
         response
           ..statusCode = HttpStatus.badGateway
@@ -378,10 +415,18 @@ final class _ProxySession {
     cancelActiveTransfers();
   }
 
-  void notifyFailure() {
+  void notifyFailure(Object error) {
     if (isClosed || _intentionalCancellation || _failureNotified) return;
     _failureNotified = true;
-    onFailure?.call(ProxyFailure(sessionId: id, trackType: trackType));
+    final reason = switch (error) {
+      RangeFetchException(:final reason) => reason,
+      FormatException() => 'invalid upstream response',
+      StateError() => 'session state failure',
+      _ => 'unexpected proxy failure',
+    };
+    onFailure?.call(
+      ProxyFailure(sessionId: id, trackType: trackType, reason: reason),
+    );
   }
 }
 

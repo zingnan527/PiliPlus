@@ -72,7 +72,7 @@ import 'package:collection/collection.dart';
 import 'package:dio/dio.dart' show Options;
 import 'package:extended_nested_scroll_view/extended_nested_scroll_view.dart'
     show ExtendedNestedScrollViewState;
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:get/get.dart';
@@ -928,7 +928,9 @@ class VideoDetailController extends GetxController
       final proxy = _rangeProxy ??= LoopbackRangeProxy();
       await proxy.start();
       await _closeRangeProxyHandles();
-      final concurrency = await ConnectivityUtils.isWiFi ? 8 : 4;
+      final concurrency = recommendedRangeProxyConcurrency(
+        isWifi: await ConnectivityUtils.isWiFi,
+      );
       final headers = <String, String>{
         'user-agent': BrowserUa.pc,
         'referer': 'https://www.bilibili.com',
@@ -960,7 +962,12 @@ class VideoDetailController extends GetxController
     }
   }
 
-  void _onRangeProxyFailure(ProxyFailure _) {
+  void _onRangeProxyFailure(ProxyFailure failure) {
+    if (kDebugMode) {
+      debugPrint(
+        'Range proxy ${failure.trackType.name} disabled: ${failure.reason}',
+      );
+    }
     if (isClosed || _rangeProxyFailOpenUsed || _rangeProxyFailOpenInProgress) {
       return;
     }
