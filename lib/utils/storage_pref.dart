@@ -447,6 +447,11 @@ abstract final class Pref {
   static bool get cdnStallRecovery =>
       _setting.get(SettingBoxKey.cdnStallRecovery, defaultValue: true);
 
+  static bool get rangeProxyAcceleration => _setting.get(
+    SettingBoxKey.rangeProxyAcceleration,
+    defaultValue: false,
+  );
+
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
 

@@ -82,6 +82,13 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.cdnStallRecovery,
     defaultVal: true,
   ),
+  const SwitchModel(
+    title: '实验性 Range 并发加速',
+    subtitle: '通过仅限本机的代理并发读取同一 CDN；异常时自动回退原生播放',
+    leading: Icon(Icons.multiple_stop),
+    setKey: SettingBoxKey.rangeProxyAcceleration,
+    defaultVal: false,
+  ),
   SwitchModel(
     title: '音频不跟随 CDN 设置',
     subtitle: '直接采用备用 URL，可解决部分视频无声',

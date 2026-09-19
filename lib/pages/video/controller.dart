@@ -52,6 +52,7 @@ import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
+import 'package:PiliPlus/services/playback_acceleration/loopback_range_proxy.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/connectivity_utils.dart';
 import 'package:PiliPlus/utils/extension/context_ext.dart';
@@ -135,6 +136,11 @@ class VideoDetailController extends GetxController
   String? videoUrl;
   String? audioUrl;
   PlaybackRouteSession? _playbackRoutes;
+  LoopbackRangeProxy? _rangeProxy;
+  ProxyMediaHandle? _videoProxyHandle;
+  ProxyMediaHandle? _audioProxyHandle;
+  bool _rangeProxyFailOpenUsed = false;
+  bool _rangeProxyFailOpenInProgress = false;
   Duration? defaultST;
   Duration? playedTime;
   String playedTimePos(bool hasParams) {
@@ -519,6 +525,7 @@ class VideoDetailController extends GetxController
     _stallRecoveryExhausted = false;
     _stallPositionSnapshot = null;
     _stallBufferSnapshot = null;
+    _rangeProxyFailOpenUsed = false;
   }
 
   Future<void> getMediaList({
@@ -854,6 +861,9 @@ class VideoDetailController extends GetxController
     Duration? seek = defaultST ?? playedTime;
     if (seek == .zero) seek = null;
     seek ??= getFirstSegment();
+    final playbackUrls = isFileSource ? null : await _resolvePlaybackUrls();
+    final resolvedVideoUrl = playbackUrls?.$1 ?? videoUrl;
+    final resolvedAudioUrl = playbackUrls?.$2 ?? audioUrl;
     await plPlayerController.setDataSource(
       isFileSource
           ? FileSource(
@@ -863,8 +873,8 @@ class VideoDetailController extends GetxController
               hasDashAudio: entry.hasDashAudio,
             )
           : NetworkSource(
-              videoSource: videoUrl!,
-              audioSource: audioUrl,
+              videoSource: resolvedVideoUrl!,
+              audioSource: resolvedAudioUrl,
             ),
       seekTo: seek,
       duration: data.timeLength == null
@@ -906,6 +916,77 @@ class VideoDetailController extends GetxController
     }
 
     defaultST = null;
+  }
+
+  Future<(String, String?)> _resolvePlaybackUrls() async {
+    final originalVideo = videoUrl!;
+    final originalAudio = audioUrl;
+    if (!Pref.rangeProxyAcceleration || _rangeProxyFailOpenUsed) {
+      return (originalVideo, originalAudio);
+    }
+    try {
+      final proxy = _rangeProxy ??= LoopbackRangeProxy();
+      await proxy.start();
+      await _closeRangeProxyHandles();
+      final concurrency = await ConnectivityUtils.isWiFi ? 8 : 4;
+      final headers = <String, String>{
+        'user-agent': BrowserUa.pc,
+        'referer': 'https://www.bilibili.com',
+      };
+      _videoProxyHandle = proxy.createSession(
+        upstream: Uri.parse(originalVideo),
+        trackType: ProxyTrackType.video,
+        maxConcurrency: concurrency,
+        headers: headers,
+        onFailure: _onRangeProxyFailure,
+      );
+      if (originalAudio != null && originalAudio.isNotEmpty) {
+        _audioProxyHandle = proxy.createSession(
+          upstream: Uri.parse(originalAudio),
+          trackType: ProxyTrackType.audio,
+          maxConcurrency: concurrency,
+          headers: headers,
+          onFailure: _onRangeProxyFailure,
+        );
+      }
+      return (
+        _videoProxyHandle!.localUri.toString(),
+        _audioProxyHandle?.localUri.toString(),
+      );
+    } catch (_) {
+      _rangeProxyFailOpenUsed = true;
+      await _closeRangeProxyHandles();
+      return (originalVideo, originalAudio);
+    }
+  }
+
+  void _onRangeProxyFailure(ProxyFailure _) {
+    if (isClosed || _rangeProxyFailOpenUsed || _rangeProxyFailOpenInProgress) {
+      return;
+    }
+    unawaited(_failOpenRangeProxy());
+  }
+
+  Future<void> _failOpenRangeProxy() async {
+    if (_rangeProxyFailOpenInProgress || _rangeProxyFailOpenUsed) return;
+    _rangeProxyFailOpenInProgress = true;
+    _rangeProxyFailOpenUsed = true;
+    try {
+      playedTime = plPlayerController.videoPlayerController?.state.position;
+      await _closeRangeProxyHandles();
+      if (!isClosed) await playerInit();
+    } finally {
+      _rangeProxyFailOpenInProgress = false;
+    }
+  }
+
+  Future<void> _closeRangeProxyHandles() async {
+    final video = _videoProxyHandle;
+    final audio = _audioProxyHandle;
+    _videoProxyHandle = null;
+    _audioProxyHandle = null;
+    await video?.close();
+    await audio?.close();
   }
 
   bool isQuerying = false;
@@ -1377,6 +1458,10 @@ class VideoDetailController extends GetxController
     _stallTimer?.cancel();
     _stallWorker?.dispose();
     _networkErrorWorker?.dispose();
+    unawaited(_closeRangeProxyHandles());
+    final rangeProxy = _rangeProxy;
+    _rangeProxy = null;
+    if (rangeProxy != null) unawaited(rangeProxy.close());
     cid.close();
     if (isFileSource) {
       cacheLocalProgress();
@@ -1404,6 +1489,8 @@ class VideoDetailController extends GetxController
     audioUrl = null;
     _playbackRoutes = null;
     _stallRecoveryExhausted = false;
+    _rangeProxyFailOpenUsed = false;
+    unawaited(_closeRangeProxyHandles());
 
     // danmaku
     savedDanmaku = null;
