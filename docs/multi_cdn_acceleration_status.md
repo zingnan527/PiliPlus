@@ -44,11 +44,15 @@ assertions.
 - Local URLs contain only a 192-bit random token. Upstream URLs and query
   strings remain in the private session map; the endpoint never accepts a URL
   parameter.
-- GET/HEAD accept one closed byte range. Each upstream chunk must return exact
-  206, Content-Range start/end/total, Content-Length, and body length.
+- GET/HEAD accept one closed byte range or mpv's observed `bytes=<start>-`
+  form. An open range is converted to a closed range only after a validated
+  `bytes=0-0` probe establishes the resource total. Suffix and multipart
+  ranges remain rejected. Each upstream chunk must return exact 206,
+  Content-Range start/end/total, Content-Length, and body length.
 - Chunks use bounded rolling concurrency and are written to the player in byte
   order. Video and audio have separate sessions and share a global budget of
-  16. Per-track defaults are Wi-Fi 8 and mobile 4, capped at 16.
+  16. Emulator A/B testing showed response timeouts at Wi-Fi 8, so conservative
+  per-track defaults are Wi-Fi 4 and mobile 2, capped at 16.
 - Session close and explicit transfer cancellation terminate active clients.
 - One proxy failure notification disables the proxy for the current playback
   and reopens the original signed URL once. This prevents an error/reopen loop.
@@ -58,7 +62,7 @@ assertions.
 
 ## Verification evidence
 
-The focused suite passes 33 tests:
+The focused suite passes 35 tests:
 
 ```text
 flutter test --no-pub \
@@ -67,25 +71,27 @@ flutter test --no-pub \
   test/services/playback_acceleration/route_probe_service_test.dart \
   test/services/playback_acceleration/loopback_range_proxy_test.dart
 
-00:01 +33: All tests passed!
+00:01 +35: All tests passed!
 ```
 
-Focused analysis of the pure acceleration modules, route utilities, settings
-keys, and settings UI reports no issues.
+Focused analysis of the acceleration modules, route utilities, settings UI,
+video controller, and player controller reports no issues.
 
-The exact repository-declared toolchain is Flutter 3.47.4 / Dart 3.13.3. A
-fresh `flutter build apk --debug --no-pub` reached
-`:app:compileFlutterBuildDebug` but exited 1. The preceding `pub get` could not
-complete plugin-link creation because Windows Developer Mode is disabled, and
-three Git dependency cache checkouts are incomplete: `media_kit`,
-`flutter_cached_network_image_ce`, and `flutter_chat_packages`. Their missing
-sources cause the first import failures and many cascading type errors. The
-build also reports Flutter/internal-API errors because the repository's CI
-normally runs `lib/scripts/patch.ps1 android` first to patch Flutter and
-`material_ui`. That upstream script was not run locally because it includes a
-hard reset of the SDK checkout and writes global Git identity. Therefore no
-APK is claimed. `flutter devices` found only Windows, Chrome, and Edge; no
-Android device or emulator is attached in this environment.
+The exact repository-declared toolchain is Flutter 3.47.4 / Dart 3.13.3. The
+build uses a short, task-local Pub cache with process-scoped Git long-path
+support. The same Android Flutter/material patches as upstream CI were applied
+without the upstream script's global Git writes or hard reset. Because Windows
+Developer Mode is disabled, the first full Android tooling generation was run
+with the unrelated Windows/Linux project directories temporarily moved aside
+and restored immediately afterward. A subsequent
+`flutter build apk --debug --no-pub` exited 0 and produced `app-debug.apk`.
+
+The APK was installed on the `Pixel_6a_API_34` emulator. Startup plugin/JNI
+registration, public-video playback, open Range handling, seek,
+pause/resume, and background/foreground recovery were exercised. The app
+process remained alive and the main activity resumed without an unhandled
+exception. An intentional transfer cancellation can still surface as one
+ffmpeg 502 warning while the replacement loopback request continues playing.
 
 ## Performance evidence
 
@@ -99,8 +105,9 @@ same video, quality, network, and time window.
 
 1. Run continuous playback, seek, quality change, part change, pause/resume,
    background/foreground, and exit tests on Android for at least 30 minutes.
-2. Confirm mpv's actual GET/HEAD/Range pattern; the MVP intentionally rejects
-   open, suffix, and multipart ranges.
+2. Confirm behavior on a physical Android device and on slower real Wi-Fi;
+   mpv open ranges are supported, while suffix and multipart ranges remain
+   intentionally rejected.
 3. Add structured metrics without logging media URL, query, cookies, or token.
 4. Only after the single-CDN device gate passes, add multiple complete API URLs
    per chunk with EWMA throughput, TTFB, failure rate, cooldown, hysteresis, and
