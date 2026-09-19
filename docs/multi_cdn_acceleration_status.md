@@ -80,7 +80,10 @@ complete plugin-link creation because Windows Developer Mode is disabled, and
 three Git dependency cache checkouts are incomplete: `media_kit`,
 `flutter_cached_network_image_ce`, and `flutter_chat_packages`. Their missing
 sources cause the first import failures and many cascading type errors. The
-build also reports upstream Flutter/internal-API compatibility errors, so no
+build also reports Flutter/internal-API errors because the repository's CI
+normally runs `lib/scripts/patch.ps1 android` first to patch Flutter and
+`material_ui`. That upstream script was not run locally because it includes a
+hard reset of the SDK checkout and writes global Git identity. Therefore no
 APK is claimed. `flutter devices` found only Windows, Chrome, and Edge; no
 Android device or emulator is attached in this environment.
 
