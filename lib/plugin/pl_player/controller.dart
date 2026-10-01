@@ -579,6 +579,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
 
   bool _processing = false;
   final _dataSourceReloads = PlaybackReloadQueue();
+  int _dataSourceGeneration = 0;
   bool get processing => _processing;
 
   // offline
@@ -611,76 +612,81 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     bool autoFullScreenFlag = false,
     bool Function()? isCurrent,
   }) {
-    return _dataSourceReloads.run(() async {
-      try {
-        _cancelSubForSeek();
-        _processing = true;
-        this.isLive = isLive;
-        _videoType = videoType ?? VideoType.ugc;
-        this.width = width;
-        this.height = height;
-        if (dataSource case NetworkSource(:final videoSource)
-            when videoSource != _networkRetrySource) {
-          _networkRetrySource = videoSource;
-          _networkOpenRetryUsed = false;
-        }
-        this.dataSource = dataSource;
-        _autoPlay = autoplay;
-        // 初始化数据加载状态
-        dataStatus.value = DataStatus.loading;
-        // 初始化全屏方向
-        _isVertical = isVertical ?? false;
-        _aid = aid;
-        _bvid = bvid;
-        this.cid = cid;
-        _epid = epid;
-        _seasonId = seasonId;
-        _pgcType = pgcType;
+    final generation = ++_dataSourceGeneration;
+    return _dataSourceReloads.run(
+      () async {
+        try {
+          _cancelSubForSeek();
+          _processing = true;
+          this.isLive = isLive;
+          _videoType = videoType ?? VideoType.ugc;
+          this.width = width;
+          this.height = height;
+          if (dataSource case NetworkSource(:final videoSource)
+              when videoSource != _networkRetrySource) {
+            _networkRetrySource = videoSource;
+            _networkOpenRetryUsed = false;
+          }
+          this.dataSource = dataSource;
+          _autoPlay = autoplay;
+          // 初始化数据加载状态
+          dataStatus.value = DataStatus.loading;
+          // 初始化全屏方向
+          _isVertical = isVertical ?? false;
+          _aid = aid;
+          _bvid = bvid;
+          this.cid = cid;
+          _epid = epid;
+          _seasonId = seasonId;
+          _pgcType = pgcType;
 
-        if (showSeekPreview) {
-          _clearPreview();
-        }
-        cancelLongPressTimer();
-        if (_videoPlayerController != null &&
-            _videoPlayerController!.state.playing) {
-          await pause(notify: false);
-        }
+          if (showSeekPreview) {
+            _clearPreview();
+          }
+          cancelLongPressTimer();
+          if (_videoPlayerController != null &&
+              _videoPlayerController!.state.playing) {
+            await pause(notify: false);
+          }
 
-        if (_playerCount == 0) {
-          return;
+          if (_playerCount == 0) {
+            return;
+          }
+          // 配置Player 音轨、字幕等等
+          await _createVideoController(dataSource, seekTo, volume);
+
+          if (_playerCount == 0) {
+            _removeListeners();
+            _videoPlayerController?.dispose();
+            _videoPlayerController = null;
+            _videoController = null;
+            return;
+          }
+
+          updateDuration(duration ?? _videoPlayerController!.state.duration);
+          position.value = buffered.value = seekTo?.inSeconds ?? 0;
+
+          dataStatus.value = .loaded;
+
+          if (autoFullScreenFlag && autoEnterFullScreen) {
+            triggerFullScreen(status: true);
+          }
+
+          await _initializePlayer();
+          onInit?.call();
+        } catch (err, stackTrace) {
+          dataStatus.value = DataStatus.error;
+          if (kDebugMode) {
+            debugPrint(stackTrace.toString());
+            debugPrint('plPlayer err:  $err');
+          }
+        } finally {
+          _processing = false;
         }
-        // 配置Player 音轨、字幕等等
-        await _createVideoController(dataSource, seekTo, volume);
-
-        if (_playerCount == 0) {
-          _removeListeners();
-          _videoPlayerController?.dispose();
-          _videoPlayerController = null;
-          _videoController = null;
-          return;
-        }
-
-        updateDuration(duration ?? _videoPlayerController!.state.duration);
-        position.value = buffered.value = seekTo?.inSeconds ?? 0;
-
-        dataStatus.value = .loaded;
-
-        if (autoFullScreenFlag && autoEnterFullScreen) {
-          triggerFullScreen(status: true);
-        }
-
-        await _initializePlayer();
-        onInit?.call();
-      } catch (err, stackTrace) {
-        dataStatus.value = DataStatus.error;
-        if (kDebugMode) {
-          debugPrint(stackTrace.toString());
-          debugPrint('plPlayer err:  $err');
-        }
-      } finally {
-        _processing = false;
-      }
-    }, isCurrent: isCurrent);
+      },
+      isCurrent: () =>
+          generation == _dataSourceGeneration && (isCurrent?.call() ?? true),
+    );
   }
 
   String? shadersDirPath;
@@ -842,14 +848,26 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     );
   }
 
-  Future<void>? refreshPlayer() {
-    if (dataSource is FileSource) {
+  Future<void>? refreshPlayer({int? sourceGeneration}) {
+    final generation = sourceGeneration ?? _dataSourceGeneration;
+    final source = dataSource;
+    if (source is FileSource || generation != _dataSourceGeneration) {
       return null;
     }
     if (_videoPlayerController case final ctr? when (ctr.current.isNotEmpty)) {
-      var media = ctr.current.last;
-      if (!isLive) media = media.copyWith(start: ctr.state.position);
-      return ctr.open(media, play: true);
+      return _dataSourceReloads.run(
+        () async {
+          if (ctr.current.isEmpty) return;
+          var media = ctr.current.last;
+          if (!isLive) media = media.copyWith(start: ctr.state.position);
+          await ctr.open(media, play: true);
+        },
+        isCurrent: () =>
+            _playerCount > 0 &&
+            generation == _dataSourceGeneration &&
+            identical(source, dataSource) &&
+            identical(ctr, _videoPlayerController),
+      );
     }
     return null;
   }
@@ -1000,6 +1018,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           }
         })),
       stream.error.listen((String event) {
+        final sourceGeneration = _dataSourceGeneration;
         if (dataSource is FileSource &&
             event.startsWith("Failed to open file")) {
           return;
@@ -1008,7 +1027,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           if (event.startsWith('tcp: ffurl_read returned ') ||
               event.startsWith("Failed to open https://") ||
               event.startsWith("Can not open external file https://")) {
-            Timer(const Duration(milliseconds: 3000), refreshPlayer);
+            Timer(const Duration(milliseconds: 3000), () {
+              refreshPlayer(sourceGeneration: sourceGeneration);
+            });
           }
           return;
         }
@@ -1027,6 +1048,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
             const Duration(milliseconds: 10000),
             () {
               Timer(const Duration(milliseconds: 3000), () {
+                if (sourceGeneration != _dataSourceGeneration ||
+                    !identical(player, _videoPlayerController)) {
+                  return;
+                }
                 // if (kDebugMode) {
                 //   debugPrint("isBuffering.value: ${isBuffering.value}");
                 // }
@@ -1038,7 +1063,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
                     '视频链接打开失败，重试中',
                     displayTime: const Duration(milliseconds: 500),
                   );
-                  refreshPlayer();
+                  refreshPlayer(sourceGeneration: sourceGeneration);
                 }
               });
             },
