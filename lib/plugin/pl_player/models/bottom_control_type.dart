@@ -11,6 +11,7 @@ enum BottomControlType {
   viewPoints,
   superResolution,
   dmChart,
+  cdn,
   qa,
   aiTranslate,
 }

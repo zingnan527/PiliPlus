@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_switch_mode.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/live_quality.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
@@ -8,6 +9,7 @@ import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/pages/setting/models/model.dart';
 import 'package:PiliPlus/pages/setting/widgets/ordered_multi_select_dialog.dart';
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
+import 'package:PiliPlus/pages/setting/widgets/slider_dialog.dart';
 import 'package:PiliPlus/plugin/pl_player/models/audio_output_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/hwdec_type.dart';
 import 'package:PiliPlus/utils/filtering_text.dart';
@@ -59,7 +61,7 @@ List<SettingsModel> get videoSettings => [
     title: 'CDN 设置',
     leading: const Icon(MdiIcons.cloudPlusOutline),
     getSubtitle: () =>
-        '当前使用：${VideoUtils.cdnService.desc}，部分 CDN 可能失效，如无法播放请尝试切换',
+        '默认线路：${VideoUtils.cdnService.desc}，部分 CDN 可能失效，如无法播放请尝试切换',
     onTap: _showCDNDialog,
   ),
   NormalModel(
@@ -75,12 +77,14 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.cdnSpeedTest,
     defaultVal: true,
   ),
-  const SwitchModel(
-    title: '卡顿自动切换 CDN',
-    subtitle: '持续卡顿时保留播放进度，并依次尝试 API 返回的完整备用 URL',
-    leading: Icon(Icons.alt_route),
-    setKey: SettingBoxKey.cdnStallRecovery,
-    defaultVal: true,
+  NormalModel(
+    title: '卡顿时切换 CDN',
+    leading: const Icon(Icons.alt_route),
+    getSubtitle: () {
+      final mode = Pref.cdnSwitchMode;
+      return '当前：${mode.label}。${mode.description}';
+    },
+    onTap: _showCdnSwitchModeDialog,
   ),
   const SwitchModel(
     title: '实验性 Range 并发加速',
@@ -88,6 +92,14 @@ List<SettingsModel> get videoSettings => [
     leading: Icon(Icons.multiple_stop),
     setKey: SettingBoxKey.rangeProxyAcceleration,
     defaultVal: false,
+  ),
+  NormalModel(
+    title: 'Range 并发上限',
+    leading: const Icon(Icons.tune),
+    getSubtitle: () =>
+        '当前最高 ${Pref.rangeProxyConcurrencyLimit} 路，实际并发由软件动态调整。'
+        '上限越高越可能触发 CDN 限流，并增加流量、耗电、发热和内存占用',
+    onTap: _showRangeProxyConcurrencyDialog,
   ),
   SwitchModel(
     title: '音频不跟随 CDN 设置',
@@ -201,6 +213,24 @@ Future<void> _showCDNDialog(BuildContext context, VoidCallback setState) async {
   if (res != null) {
     VideoUtils.cdnService = res;
     await GStorage.setting.put(SettingBoxKey.CDNService, res.name);
+    setState();
+  }
+}
+
+Future<void> _showCdnSwitchModeDialog(
+  BuildContext context,
+  VoidCallback setState,
+) async {
+  final res = await showDialog<CdnSwitchMode>(
+    context: context,
+    builder: (context) => SelectDialog<CdnSwitchMode>(
+      title: '卡顿时切换 CDN',
+      value: Pref.cdnSwitchMode,
+      values: CdnSwitchMode.values.map((mode) => (mode, mode.label)).toList(),
+    ),
+  );
+  if (res != null) {
+    await Pref.setCdnSwitchMode(res);
     setState();
   }
 }
@@ -585,3 +615,27 @@ void _showBufferSecDialog(BuildContext context, VoidCallback setState) =>
       title: '缓冲时长',
       suffix: 's',
     );
+
+Future<void> _showRangeProxyConcurrencyDialog(
+  BuildContext context,
+  VoidCallback setState,
+) async {
+  final result = await showDialog<double>(
+    context: context,
+    builder: (context) => SliderDialog(
+      title: const Text('Range 并发上限'),
+      min: 1,
+      max: 128,
+      divisions: 127,
+      precise: 0,
+      value: Pref.rangeProxyConcurrencyLimit.toDouble(),
+      suffix: ' 路',
+    ),
+  );
+  if (result == null) return;
+  await GStorage.setting.put(
+    SettingBoxKey.rangeProxyConcurrencyLimit,
+    result.toInt(),
+  );
+  setState();
+}

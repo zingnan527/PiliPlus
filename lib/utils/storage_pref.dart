@@ -19,6 +19,7 @@ import 'package:PiliPlus/models/common/super_chat_type.dart';
 import 'package:PiliPlus/models/common/super_resolution_type.dart';
 import 'package:PiliPlus/models/common/theme/theme_type.dart';
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_switch_mode.dart';
 import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/live_quality.dart';
 import 'package:PiliPlus/models/common/video/subtitle_pref_type.dart';
@@ -444,13 +445,43 @@ abstract final class Pref {
   static bool get cdnSpeedTest =>
       _setting.get(SettingBoxKey.cdnSpeedTest, defaultValue: true);
 
+  /// The configured CDN recovery policy.
+  ///
+  /// The mode key takes precedence.  If it has not been written yet, migrate
+  /// the old boolean key (`false` => off, `true` => manual).  Manual remains
+  /// the safe default for both old and new installations.
+  static CdnSwitchMode get cdnSwitchMode => CdnSwitchMode.fromStorage(
+    _setting.get(SettingBoxKey.cdnStallRecoveryMode),
+    legacyValue: _setting.get(SettingBoxKey.cdnStallRecovery),
+  );
+
+  /// Alias kept explicit for callers that still use the old feature name.
+  static CdnSwitchMode get cdnStallRecoveryMode => cdnSwitchMode;
+
+  /// Compatibility view for code that only needs to know whether recovery is
+  /// enabled.  Automatic and manual modes both return true.
   static bool get cdnStallRecovery =>
-      _setting.get(SettingBoxKey.cdnStallRecovery, defaultValue: true);
+      cdnSwitchMode != CdnSwitchMode.off;
+
+  /// Persists the three-state mode and updates the legacy boolean for older
+  /// versions that may read the same settings backup.
+  static Future<void> setCdnSwitchMode(CdnSwitchMode mode) async {
+    await _setting.put(
+      SettingBoxKey.cdnStallRecovery,
+      mode != CdnSwitchMode.off,
+    );
+    await _setting.put(SettingBoxKey.cdnStallRecoveryMode, mode.name);
+  }
 
   static bool get rangeProxyAcceleration => _setting.get(
     SettingBoxKey.rangeProxyAcceleration,
     defaultValue: false,
   );
+
+  static int get rangeProxyConcurrencyLimit => (_setting.get(
+    SettingBoxKey.rangeProxyConcurrencyLimit,
+    defaultValue: 64,
+  ) as int).clamp(1, 128);
 
   static bool get autoUpdate =>
       _setting.get(SettingBoxKey.autoUpdate, defaultValue: true);

@@ -36,6 +36,8 @@ final class FakeRangeOriginMode {
   static const slowFirstByte = FakeRangeOriginMode._('slowFirstByte', 9);
   static const slowHeader = FakeRangeOriginMode._('slowHeader', 10);
   static const tailStall = FakeRangeOriginMode._('tailStall', 11);
+  static const prefixTailStall = FakeRangeOriginMode._('prefixTailStall', 12);
+  static const reverseJitter = FakeRangeOriginMode._('reverseJitter', 13);
 
   // Common short spellings.  They intentionally point at the canonical value
   // so equality and URI generation remain deterministic.
@@ -62,6 +64,8 @@ final class FakeRangeOriginMode {
   static const headerSlow = slowHeader;
   static const stall = tailStall;
   static const stallTail = tailStall;
+  static const stallBeyondPrefix = prefixTailStall;
+  static const jitter = reverseJitter;
 
   static const values = <FakeRangeOriginMode>[
     correct206,
@@ -76,6 +80,8 @@ final class FakeRangeOriginMode {
     slowFirstByte,
     slowHeader,
     tailStall,
+    prefixTailStall,
+    reverseJitter,
   ];
 
   @override
@@ -178,6 +184,7 @@ final class FakeRangeOrigin {
   final int? _shortBodyLength;
   final int? _longBodyLength;
   final int? _tailBytes;
+  final int _prefixBytes;
 
   final Set<Socket> _sockets = <Socket>{};
   final Map<Socket, StreamSubscription<List<int>>> _subscriptions =
@@ -208,6 +215,7 @@ final class FakeRangeOrigin {
     required int? shortBodyLength,
     required int? longBodyLength,
     required int? tailBytes,
+    required int prefixBytes,
   }) : _payload = List<int>.unmodifiable(payload),
        _timeoutDelay = timeoutDelay,
        _slowFirstByteDelay = slowFirstByteDelay,
@@ -223,7 +231,8 @@ final class FakeRangeOrigin {
        _interruptAfterBytes = interruptAfterBytes,
        _shortBodyLength = shortBodyLength,
        _longBodyLength = longBodyLength,
-       _tailBytes = tailBytes {
+       _tailBytes = tailBytes,
+       _prefixBytes = prefixBytes {
     _server.listen(_accept, onError: (_) {});
   }
 
@@ -259,6 +268,7 @@ final class FakeRangeOrigin {
     int interruptAfterBytes = 1,
     int? interruptAfter,
     int? tailBytes,
+    int prefixBytes = 4096,
   }) async {
     final requestedLength = payload?.length ?? payloadSize ?? payloadLength;
     if (requestedLength <= 0 && payload == null) {
@@ -308,6 +318,7 @@ final class FakeRangeOrigin {
       shortBodyLength: shortBodyLength ?? shortBodyBytes,
       longBodyLength: longBodyLength ?? longBodyBytes,
       tailBytes: tailBytes,
+      prefixBytes: prefixBytes,
     );
   }
 
@@ -527,6 +538,61 @@ final class FakeRangeOrigin {
       }
       await _wait(_tailStallDelay);
       if (!_closed) await _closeSignal.future;
+      return;
+    }
+
+    if (mode == 'prefixTailStall') {
+      // Serves ranges inside [0, _prefixBytes) normally — this keeps the
+      // identity probe window healthy — but stalls any range reaching beyond
+      // the prefix, simulating an upstream that probes fine yet dies during
+      // the real media body.
+      final prefixLimit = _prefixBytes.clamp(0, _payload.length);
+      if (effectiveRange.end < prefixLimit) {
+        await _writeResponse(
+          socket,
+          status: 206,
+          body: normalBody,
+          contentRange: normalContentRange,
+        );
+        return;
+      }
+      await _writeHeaders(
+        socket,
+        status: 206,
+        contentLength: normalBody.length,
+        contentRange: normalContentRange,
+      );
+      final count = (prefixLimit - effectiveRange.start).clamp(
+        0,
+        normalBody.length,
+      );
+      if (count > 0) {
+        try {
+          socket.add(normalBody.sublist(0, count));
+          await socket.flush();
+        } catch (_) {
+          return;
+        }
+      }
+      await _wait(_tailStallDelay);
+      if (!_closed) await _closeSignal.future;
+      return;
+    }
+
+    if (mode == 'reverseJitter') {
+      // Later ranges are served sooner, so concurrently issued pieces
+      // complete out of order.  The proxy must still emit them in order.
+      final delayMs = ((_payload.length - effectiveRange.start) ~/ 512).clamp(
+        0,
+        60,
+      );
+      if (!await _wait(Duration(milliseconds: delayMs))) return;
+      await _writeResponse(
+        socket,
+        status: 206,
+        body: normalBody,
+        contentRange: normalContentRange,
+      );
       return;
     }
 
@@ -768,6 +834,8 @@ final class FakeRangeOrigin {
       'slowfirstbyte' || 'slowttfb' || 'slow' => 'slowFirstByte',
       'slowheader' || 'headerslow' => 'slowHeader',
       'tailstall' || 'stalltail' || 'stall' => 'tailStall',
+      'prefixtailstall' || 'stallbeyondprefix' => 'prefixTailStall',
+      'reversejitter' || 'jitter' => 'reverseJitter',
       _ => 'correct206',
     };
   }

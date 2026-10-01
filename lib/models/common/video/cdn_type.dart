@@ -18,6 +18,7 @@ enum CDNService {
   hw_08c('08c（华为云，融合CDN）', 'upos-sz-mirror08c.bilivideo.com'),
   hw_08h('08h（华为云，融合CDN）', 'upos-sz-mirror08h.bilivideo.com'),
   hw_08ct('08ct（华为云，融合CDN）', 'upos-sz-mirror08ct.bilivideo.com'),
+  baidu2('bda2（百度云，实验性）', 'upos-sz-upcdnbda2.bilivideo.com'),
   tf_hw('tf_hw（华为云）', 'upos-tf-all-hw.bilivideo.com'),
   tf_tx('tf_tx（腾讯云）', 'upos-tf-all-tx.bilivideo.com'),
   akamai('akamai（Akamai海外）', 'upos-hz-mirrorakam.akamaized.net'),

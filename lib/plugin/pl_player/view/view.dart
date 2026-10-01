@@ -23,6 +23,7 @@ import 'package:PiliPlus/models/common/sponsor_block/post_segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_type.dart';
 import 'package:PiliPlus/models/common/super_resolution_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/video/play/url.dart';
 import 'package:PiliPlus/models_new/video/video_detail/episode.dart' as ugc;
 import 'package:PiliPlus/models_new/video/video_detail/ugc_season.dart';
@@ -31,6 +32,7 @@ import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/live_room/widgets/bottom_control.dart'
     as live_bottom;
 import 'package:PiliPlus/pages/video/controller.dart';
+import 'package:PiliPlus/pages/video/widgets/cdn_control_button.dart';
 import 'package:PiliPlus/pages/video/introduction/pgc/controller.dart';
 import 'package:PiliPlus/pages/video/post_panel/popup_menu_text.dart';
 import 'package:PiliPlus/pages/video/post_panel/view.dart';
@@ -64,6 +66,8 @@ import 'package:PiliPlus/utils/path_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
+import 'package:PiliPlus/utils/storage_pref.dart';
+import 'package:PiliPlus/utils/video_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:collection/collection.dart';
@@ -108,6 +112,7 @@ class PLVideoPlayer extends StatefulWidget {
   final PlPlayerController plPlayerController;
   final VideoDetailController? videoDetailController;
   final CommonIntroController? introController;
+
   final Widget headerControl;
   final Widget? bottomControl;
   final Widget? danmuWidget;
@@ -479,6 +484,25 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
           }
           return const SizedBox.shrink();
         },
+      ),
+
+      BottomControlType.cdn => CdnControlButton(
+        stream: videoDetailController.rangeProxyConcurrencyStream,
+        initialSnapshot: videoDetailController.rangeProxyConcurrencySnapshot,
+        currentCdn: () => videoDetailController.currentCdnHost,
+        accelerationStatus: () => videoDetailController.rangeProxyStatus,
+        selectedService: () => VideoUtils.cdnService,
+        maxConcurrency: () => Pref.rangeProxyConcurrencyLimit,
+        switchMode: () => Pref.cdnSwitchMode,
+        sample: videoDetailController.firstVideo,
+        speedTest: Pref.cdnSpeedTest,
+        onCdnSelected: (CDNService service) =>
+            videoDetailController.selectCdnService(service),
+        onConcurrencyLimitChanged: (limit) => GStorage.setting.put(
+          SettingBoxKey.rangeProxyConcurrencyLimit,
+          limit,
+        ),
+        onSwitchModeChanged: Pref.setCdnSwitchMode,
       ),
 
       /// 超分辨率
@@ -888,6 +912,7 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
     final flag =
         isFullScreen || plPlayerController.isDesktopPip || maxWidth >= 500;
     final List<BottomControlType> userSpecifyItemRight = [
+      if (isNotFileSource) .cdn,
       if (isNotFileSource && plPlayerController.showDmChart) .dmChart,
       if (plPlayerController.isAnim) .superResolution,
       if (isNotFileSource && plPlayerController.showViewPoints) .viewPoints,

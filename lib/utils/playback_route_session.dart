@@ -41,12 +41,18 @@ final class PlaybackRouteSession {
 
   String get videoUrl => _video.current;
   String? get audioUrl => _audio?.current;
+  List<String> get videoCandidates => _video.urls;
+  List<String> get audioCandidates => _audio?.urls ?? const [];
 
   /// Advances to the next server-supplied video URL.
   ///
   /// Every host is returned at most once. Once exhausted, this keeps returning
   /// `null` for the lifetime of the playback session.
   String? nextVideo() => _video.next();
+
+  /// Selects a measured, server-approved route without consuming any other
+  /// candidate. Returns false when [url] is not part of this session.
+  bool selectVideo(String url) => _video.select(url);
 
   String? nextAudio() => _audio?.next();
 
@@ -137,6 +143,14 @@ final class _RouteCursor {
   _RouteCursor(List<String> urls) : _urls = List.unmodifiable(urls);
 
   String get current => _urls[_index];
+  List<String> get urls => _urls;
+
+  bool select(String url) {
+    final index = _urls.indexOf(url);
+    if (index < 0) return false;
+    _index = index;
+    return true;
+  }
 
   String? next() {
     final nextIndex = _index + 1;

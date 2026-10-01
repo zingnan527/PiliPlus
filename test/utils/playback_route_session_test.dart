@@ -35,6 +35,26 @@ void main() {
       expect(session.nextVideo(), isNull);
     });
 
+    test(
+      'exposes candidates without advancing and switches only when selected',
+      () {
+        final session = PlaybackRouteSession(
+          videoUrls: const [cosov, tfHw, akamai],
+        );
+
+        expect(session.videoCandidates, const [cosov, tfHw, akamai]);
+        expect(session.videoUrl, cosov);
+
+        expect(session.selectVideo(akamai), isTrue);
+        expect(session.videoUrl, akamai);
+        expect(
+          session.selectVideo('https://untrusted.example/video.m4s'),
+          isFalse,
+        );
+        expect(session.videoUrl, akamai);
+      },
+    );
+
     test('keeps a whitelisted bilivideo override as the first route', () {
       final session = PlaybackRouteSession(
         videoUrls: const [cosov, tfHw],
@@ -92,6 +112,20 @@ void main() {
       expect(session.audioUrl, audioCosov);
       expect(session.nextAudio(), audioAli);
       expect(session.videoUrl, tfHw);
+    });
+
+    test('exposes audio candidates independently from video candidates', () {
+      const audioCosov =
+          'https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/audio.m4s?upsig=audio-cos';
+      const audioAli =
+          'https://upos-sz-mirroraliov.bilivideo.com/upgcxcode/audio.m4s?upsig=audio-ali';
+      final session = PlaybackRouteSession(
+        videoUrls: const [cosov, tfHw],
+        audioUrls: const [audioCosov, audioAli],
+      );
+
+      expect(session.videoCandidates, const [cosov, tfHw]);
+      expect(session.audioCandidates, const [audioCosov, audioAli]);
     });
 
     test('bounds recovery to eight routes even with a larger local pool', () {

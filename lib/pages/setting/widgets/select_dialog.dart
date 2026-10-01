@@ -19,6 +19,7 @@ class SelectDialog<T> extends StatelessWidget {
   final String title;
   final List<(T, String)> values;
   final Widget Function(BuildContext, int)? subtitleBuilder;
+  final Widget? header;
   final bool toggleable;
 
   const SelectDialog({
@@ -27,6 +28,7 @@ class SelectDialog<T> extends StatelessWidget {
     required this.values,
     required this.title,
     this.subtitleBuilder,
+    this.header,
     this.toggleable = false,
   });
 
@@ -48,22 +50,25 @@ class SelectDialog<T> extends StatelessWidget {
             groupValue: value,
             child: Column(
               mainAxisSize: MainAxisSize.min,
-              children: List.generate(
-                values.length,
-                (index) {
-                  final item = values[index];
-                  return RadioListTile<T>(
-                    toggleable: toggleable,
-                    dense: true,
-                    value: item.$1,
-                    title: Text(
-                      item.$2,
-                      style: titleMedium,
-                    ),
-                    subtitle: subtitleBuilder?.call(context, index),
-                  );
-                },
-              ),
+              children: [
+                ?header,
+                ...List.generate(
+                  values.length,
+                  (index) {
+                    final item = values[index];
+                    return RadioListTile<T>(
+                      toggleable: toggleable,
+                      dense: true,
+                      value: item.$1,
+                      title: Text(
+                        item.$2,
+                        style: titleMedium,
+                      ),
+                      subtitle: subtitleBuilder?.call(context, index),
+                    );
+                  },
+                ),
+              ],
             ),
           ),
         ),
@@ -74,10 +79,16 @@ class SelectDialog<T> extends StatelessWidget {
 
 class CdnSelectDialog extends StatefulWidget {
   final BaseItem? sample;
+  final Widget? header;
+  final bool? speedTest;
+  final CDNService? selectedService;
 
   const CdnSelectDialog({
     super.key,
     this.sample,
+    this.header,
+    this.speedTest,
+    this.selectedService,
   });
 
   @override
@@ -92,7 +103,7 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
 
   @override
   void initState() {
-    _cdnSpeedTest = Pref.cdnSpeedTest;
+    _cdnSpeedTest = widget.speedTest ?? Pref.cdnSpeedTest;
     if (_cdnSpeedTest) {
       _probeCancellation = ProbeCancellation();
       _dio =
@@ -282,8 +293,9 @@ class _CdnSelectDialogState extends State<CdnSelectDialog> {
   Widget build(BuildContext context) {
     return SelectDialog<CDNService>(
       title: 'CDN 设置',
+      header: widget.header,
       values: CDNService.values.map((i) => (i, i.desc)).toList(),
-      value: VideoUtils.cdnService,
+      value: widget.selectedService ?? VideoUtils.cdnService,
       subtitleBuilder: _cdnSpeedTest
           ? (context, index) {
               final item = _cdnResList[index];

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' show min;
 import 'dart:ui';
 
@@ -21,6 +22,8 @@ import 'package:PiliPlus/models/common/sponsor_block/post_segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_type.dart';
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_switch_mode.dart';
+import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/source_type.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
@@ -47,12 +50,18 @@ import 'package:PiliPlus/pages/video/note/view.dart';
 import 'package:PiliPlus/pages/video/post_panel/view.dart';
 import 'package:PiliPlus/pages/video/send_danmaku/view.dart';
 import 'package:PiliPlus/pages/video/widgets/header_control.dart';
+import 'package:PiliPlus/pages/video/widgets/cdn_switch_suggestion.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
 import 'package:PiliPlus/services/playback_acceleration/loopback_range_proxy.dart';
+import 'package:PiliPlus/services/playback_acceleration/frame_stall_detector.dart';
+import 'package:PiliPlus/services/playback_acceleration/byte_range.dart';
+import 'package:PiliPlus/services/playback_acceleration/range_fetcher.dart';
+import 'package:PiliPlus/services/playback_acceleration/route_probe_service.dart';
+import 'package:PiliPlus/services/playback_acceleration/route_switch_recommendation.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/connectivity_utils.dart';
 import 'package:PiliPlus/utils/extension/context_ext.dart';
@@ -64,6 +73,7 @@ import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
 import 'package:PiliPlus/utils/playback_route_session.dart';
 import 'package:PiliPlus/utils/storage.dart';
+import 'package:PiliPlus/utils/storage_key.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
 import 'package:PiliPlus/utils/theme_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
@@ -139,6 +149,24 @@ class VideoDetailController extends GetxController
   LoopbackRangeProxy? _rangeProxy;
   ProxyMediaHandle? _videoProxyHandle;
   ProxyMediaHandle? _audioProxyHandle;
+  StreamSubscription<RangeConcurrencySnapshot>?
+  _rangeProxyConcurrencySubscription;
+  final Rx<RangeConcurrencySnapshot> rangeProxyConcurrency =
+      const RangeConcurrencySnapshot(0, 0).obs;
+  Stream<RangeConcurrencySnapshot> get rangeProxyConcurrencyStream =>
+      rangeProxyConcurrency.stream;
+  RangeConcurrencySnapshot get rangeProxyConcurrencySnapshot =>
+      rangeProxyConcurrency.value;
+  String get rangeProxyStatus {
+    if (!Pref.rangeProxyAcceleration) return '并发加速已关闭';
+    if (_rangeProxyFailOpenUsed) return '故障后回退原生播放';
+    if (_videoProxyHandle == null) return '加速尚未启动';
+    if (rangeProxyConcurrency.value.activeRequests == 0) {
+      return '暂无分片请求（不代表加速已关闭）';
+    }
+    return '正在下载分片';
+  }
+
   bool _rangeProxyFailOpenUsed = false;
   bool _rangeProxyFailOpenInProgress = false;
   Duration? defaultST;
@@ -182,8 +210,15 @@ class VideoDetailController extends GetxController
   Worker? _stallWorker;
   Worker? _networkErrorWorker;
   Timer? _stallTimer;
+  Timer? _frameMonitorTimer;
+  final _frameMonitorClock = Stopwatch()..start();
+  final _frameStallDetector = FrameStallDetector();
+  final _automaticCdnSwitchGuard = AutomaticCdnSwitchGuard();
   bool _isStallReloading = false;
-  bool _stallRecoveryExhausted = false;
+  bool _isCdnProbeRunning = false;
+  bool _stallSuggestionVisible = false;
+  bool _stallPromptSuppressed = false;
+  ProbeCancellation? _probeCancellation;
   int? _stallPositionSnapshot;
   int? _stallBufferSnapshot;
   static const _stallGrace = Duration(milliseconds: 2500);
@@ -411,23 +446,75 @@ class VideoDetailController extends GetxController
       initialIndex: Pref.defaultShowComment ? 1 : 0,
     );
 
-    if (!isFileSource && Pref.cdnStallRecovery) {
+    if (!isFileSource) {
       _stallWorker = ever(plPlayerController.isBuffering, _onBufferingChange);
       _networkErrorWorker = ever(
         plPlayerController.networkOpenFailures,
         (_) => unawaited(_onNetworkOpenFailure()),
       );
+      _frameMonitorTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        _observeFrameProgress,
+      );
+    }
+  }
+
+  void _observeFrameProgress(Timer _) {
+    if (isClosed ||
+        Pref.cdnSwitchMode == CdnSwitchMode.off ||
+        isQuerying ||
+        _isStallReloading ||
+        plPlayerController.cid != cid.value ||
+        !plPlayerController.playerStatus.isPlaying ||
+        plPlayerController.isBuffering.value ||
+        plPlayerController.isSeeking.value ||
+        Get.currentRoute != '/videoV') {
+      _frameStallDetector.reset();
+      return;
+    }
+    final player = plPlayerController.videoPlayerController;
+    if (player is! NativePlayer) {
+      _frameStallDetector.reset();
+      return;
+    }
+    final audioSeconds = double.tryParse(player.getProperty('audio-pts'));
+    final videoSeconds = double.tryParse(player.getProperty('time-pos'));
+    if (audioSeconds == null ||
+        videoSeconds == null ||
+        !audioSeconds.isFinite ||
+        !videoSeconds.isFinite ||
+        audioSeconds < 0 ||
+        videoSeconds < 0) {
+      _frameStallDetector.reset();
+      return;
+    }
+    final frozen = _frameStallDetector.sample(
+      wallTime: _frameMonitorClock.elapsed,
+      audioTime: Duration(milliseconds: (audioSeconds * 1000).round()),
+      videoTime: Duration(milliseconds: (videoSeconds * 1000).round()),
+    );
+    if (frozen) {
+      if (kDebugMode) {
+        debugPrint('Video frame clock stalled while audio advanced');
+      }
+      unawaited(_probeAndSuggestVideoRoute());
     }
   }
 
   void _onBufferingChange(bool buffering) {
+    if (buffering) {
+      _videoProxyHandle?.requestMoreConcurrency();
+    }
+    if (!Pref.cdnStallRecovery) return;
     if (_isStallReloading) return;
     _stallTimer?.cancel();
     _stallTimer = null;
     if (!buffering) {
       _stallPositionSnapshot = null;
       _stallBufferSnapshot = null;
-    } else if (!_stallRecoveryExhausted) {
+      _stallPromptSuppressed = false;
+      _probeCancellation?.cancel();
+    } else if (!_stallPromptSuppressed) {
       _captureStallProgress();
       _stallTimer = Timer(_stallGrace, _handleStall);
     }
@@ -468,7 +555,7 @@ class VideoDetailController extends GetxController
       _stallTimer = Timer(_stallGrace, _handleStall);
       return;
     }
-    await _switchToNextVideoRoute();
+    await _probeAndSuggestVideoRoute();
   }
 
   Future<void> _onNetworkOpenFailure() async {
@@ -480,35 +567,203 @@ class VideoDetailController extends GetxController
     }
     _stallTimer?.cancel();
     _stallTimer = null;
-    await _switchToNextVideoRoute();
+    await _probeAndSuggestVideoRoute();
   }
 
-  Future<void> _switchToNextVideoRoute() async {
-    if (_isStallReloading) return;
-    final routes = _playbackRoutes;
-    if (routes == null) return;
-    final next = routes.nextVideo();
-    if (next == null) {
-      _stallRecoveryExhausted = true;
-      SmartDialog.showToast('可用 CDN 已全部尝试，已停止自动切换');
+  Future<void> _probeAndSuggestVideoRoute() async {
+    final switchMode = Pref.cdnSwitchMode;
+    if (switchMode == CdnSwitchMode.off) return;
+    if (switchMode == CdnSwitchMode.automatic &&
+        !_automaticCdnSwitchGuard.canSwitch(_frameMonitorClock.elapsed)) {
       return;
     }
-    playedTime = plPlayerController.videoPlayerController?.state.position;
-    videoUrl = next;
-    SmartDialog.showToast('播放卡顿，切换 CDN：${Uri.parse(next).host}');
+    if (_isStallReloading ||
+        _isCdnProbeRunning ||
+        _stallSuggestionVisible ||
+        _stallPromptSuppressed) {
+      return;
+    }
+    final routes = _playbackRoutes;
+    if (routes == null) return;
+    final candidates = routes.videoCandidates;
+    if (candidates.length < 2) {
+      _stallPromptSuppressed = true;
+      SmartDialog.showToast('检测到播放卡顿，但没有其他可测速的 CDN');
+      return;
+    }
+
+    _stallPromptSuppressed = true;
+    _isCdnProbeRunning = true;
+    final cancellation = ProbeCancellation();
+    _probeCancellation?.cancel();
+    _probeCancellation = cancellation;
+    try {
+      final service = RouteProbeService<String>(
+        maxConcurrency: 4,
+        probe: _probeVideoRoute,
+      );
+      final results = await service.probeAll(
+        candidates,
+        cancellation: cancellation,
+      );
+      if (isClosed ||
+          cancellation.isCancelled ||
+          _playbackRoutes != routes ||
+          Pref.cdnSwitchMode != switchMode) {
+        return;
+      }
+      final recommendation = CdnSwitchRecommendation.fromProbeResults(
+        currentUrl: routes.videoUrl,
+        results: results,
+      );
+      if (recommendation == null) {
+        final successCount = results.where((result) => result.isSuccess).length;
+        if (switchMode == CdnSwitchMode.manual) {
+          SmartDialog.showToast(
+            successCount == 0 ? 'CDN 测速失败，已保留当前线路' : '测速完成，当前线路已是最快可用 CDN',
+          );
+        }
+        return;
+      }
+      switch (chooseCdnSwitchAction(switchMode, recommendation)) {
+        case CdnSwitchAction.none:
+          return;
+        case CdnSwitchAction.suggest:
+          _showCdnSwitchSuggestion(routes, recommendation);
+        case CdnSwitchAction.switchAutomatically:
+          if (!_automaticCdnSwitchGuard.canSwitch(_frameMonitorClock.elapsed)) {
+            return;
+          }
+          _automaticCdnSwitchGuard.recordSwitch(_frameMonitorClock.elapsed);
+          await _switchToMeasuredVideoRoute(routes, recommendation);
+      }
+    } finally {
+      if (_probeCancellation == cancellation) _probeCancellation = null;
+      _isCdnProbeRunning = false;
+    }
+  }
+
+  Future<RouteProbeSample> _probeVideoRoute(
+    String candidate,
+    ProbeCancellation cancellation,
+  ) async {
+    cancellation.throwIfCancelled();
+    final client = HttpClient()..autoUncompress = false;
+    try {
+      final chunk =
+          await const StrictRangeFetcher(
+            responseTimeout: Duration(seconds: 4),
+            bodyStallTimeout: Duration(seconds: 3),
+            totalTimeout: Duration(seconds: 7),
+          ).fetch(
+            client,
+            Uri.parse(candidate),
+            const ByteRange(0, 262143),
+            headers: const {
+              'user-agent': BrowserUa.pc,
+              'referer': 'https://www.bilibili.com',
+            },
+          );
+      cancellation.throwIfCancelled();
+      return RouteProbeSample(
+        bytes: chunk.bytes.length,
+        ttfb: chunk.ttfb,
+        elapsed: chunk.elapsed,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  void _showCdnSwitchSuggestion(
+    PlaybackRouteSession routes,
+    CdnSwitchRecommendation recommendation,
+  ) {
+    const tag = 'cdn-switch-suggestion';
+    _stallSuggestionVisible = true;
+    SmartDialog.show<void>(
+      tag: tag,
+      keepSingle: true,
+      alignment: Alignment.bottomCenter,
+      usePenetrate: true,
+      clickMaskDismiss: false,
+      maskColor: Colors.transparent,
+      onDismiss: () => _stallSuggestionVisible = false,
+      builder: (context) => CdnSwitchSuggestion(
+        currentHost: Uri.parse(recommendation.currentUrl).host,
+        targetHost: Uri.parse(recommendation.targetUrl).host,
+        targetBytesPerSecond: recommendation.targetSample.bytesPerSecond,
+        targetTtfb: recommendation.targetSample.ttfb,
+        improvementPercent: recommendation.improvementPercent,
+        onDismiss: () => SmartDialog.dismiss(tag: tag),
+        onSwitch: () {
+          SmartDialog.dismiss(tag: tag);
+          unawaited(_switchToMeasuredVideoRoute(routes, recommendation));
+        },
+      ),
+    );
+  }
+
+  Future<void> _switchToMeasuredVideoRoute(
+    PlaybackRouteSession routes,
+    CdnSwitchRecommendation recommendation,
+  ) async {
+    if (isClosed || _isStallReloading || _playbackRoutes != routes) return;
+    if (!routes.selectVideo(recommendation.targetUrl)) return;
+
+    Duration? audioPosition;
+    if (_frameStallDetector.isFrozen) {
+      if (plPlayerController.videoPlayerController
+          case final NativePlayer player) {
+        final audioSeconds = double.tryParse(player.getProperty('audio-pts'));
+        if (audioSeconds != null && audioSeconds.isFinite && audioSeconds > 0) {
+          audioPosition = Duration(
+            milliseconds: (audioSeconds * 1000).round(),
+          );
+        }
+      }
+    }
+    final resumePosition = chooseResumePosition(
+      playerPosition: plPlayerController.videoPlayerController?.state.position,
+      audioPosition: audioPosition,
+      lastReportedSeconds: plPlayerController.position.value,
+      previousResumePosition: playedTime,
+    );
+    _frameStallDetector.reset();
+    playedTime = resumePosition;
+    videoUrl = routes.videoUrl;
     _isStallReloading = true;
     try {
       await playerInit();
+      if (resumePosition > Duration.zero) {
+        await plPlayerController.seekTo(resumePosition, isSeek: false);
+      }
+      SmartDialog.showToast('已切换至 ${Uri.parse(routes.videoUrl).host}');
     } finally {
       _isStallReloading = false;
-      if (!isClosed &&
-          plPlayerController.isBuffering.value &&
-          plPlayerController.cid == cid.value &&
-          plPlayerController.playerStatus.isPlaying) {
-        _captureStallProgress();
-        _stallTimer = Timer(_stallRetry, _handleStall);
-      }
+      if (!plPlayerController.isBuffering.value) _stallPromptSuppressed = false;
     }
+  }
+
+  String get currentCdnHost {
+    final host = Uri.tryParse(videoUrl ?? '')?.host;
+    return host == null || host.isEmpty ? VideoUtils.cdnService.desc : host;
+  }
+
+  /// Select a CDN manually without dropping the current playback position.
+  Future<void> selectCdnService(CDNService service) async {
+    if (isClosed || isFileSource || isQuerying) return;
+    playedTime = chooseResumePosition(
+      playerPosition: plPlayerController.videoPlayerController?.state.position,
+      lastReportedSeconds: plPlayerController.position.value,
+      previousResumePosition: playedTime,
+    );
+    defaultST = null;
+    _autoPlay.value = true;
+    VideoUtils.cdnService = service;
+    await setting.put(SettingBoxKey.CDNService, service.name);
+    SmartDialog.showToast('已设置为 ${service.desc}，正在从当前进度重载');
+    await queryVideoUrl(fromReset: true);
   }
 
   void _setPlaybackRoutes({
@@ -520,9 +775,12 @@ class VideoDetailController extends GetxController
       audioUrls: audioUrls,
     );
     _playbackRoutes = routes;
+    _frameStallDetector.reset();
+    _automaticCdnSwitchGuard.reset();
     videoUrl = routes.videoUrl;
     audioUrl = routes.audioUrl ?? '';
-    _stallRecoveryExhausted = false;
+    _probeCancellation?.cancel();
+    _stallPromptSuppressed = false;
     _stallPositionSnapshot = null;
     _stallBufferSnapshot = null;
     _rangeProxyFailOpenUsed = false;
@@ -679,8 +937,11 @@ class VideoDetailController extends GetxController
   int get currPosInMilliseconds =>
       defaultST?.inMilliseconds ?? plPlayerController.positionInMilliseconds;
   @override
-  Future<void> seekTo(Duration duration, {required bool isSeek}) =>
-      plPlayerController.seekTo(duration, isSeek: isSeek);
+  Future<void> seekTo(Duration duration, {required bool isSeek}) {
+    _videoProxyHandle?.cancelActiveTransfers();
+    _audioProxyHandle?.cancelActiveTransfers();
+    return plPlayerController.seekTo(duration, isSeek: isSeek);
+  }
 
   @override
   Widget buildItem(Object item, Animation<double> animation) {
@@ -925,11 +1186,15 @@ class VideoDetailController extends GetxController
       return (originalVideo, originalAudio);
     }
     try {
-      final proxy = _rangeProxy ??= LoopbackRangeProxy();
+      final concurrencyLimit = Pref.rangeProxyConcurrencyLimit;
+      final proxy = _rangeProxy ??= LoopbackRangeProxy(
+        globalMaxConcurrency: concurrencyLimit,
+      );
       await proxy.start();
       await _closeRangeProxyHandles();
-      final concurrency = recommendedRangeProxyConcurrency(
+      final initialConcurrency = recommendedRangeProxyConcurrency(
         isWifi: await ConnectivityUtils.isWiFi,
+        maxConcurrency: concurrencyLimit,
       );
       final headers = <String, String>{
         'user-agent': BrowserUa.pc,
@@ -938,15 +1203,20 @@ class VideoDetailController extends GetxController
       _videoProxyHandle = proxy.createSession(
         upstream: Uri.parse(originalVideo),
         trackType: ProxyTrackType.video,
-        maxConcurrency: concurrency,
+        maxConcurrency: concurrencyLimit,
+        initialConcurrency: initialConcurrency,
         headers: headers,
         onFailure: _onRangeProxyFailure,
       );
+      rangeProxyConcurrency.value = _videoProxyHandle!.concurrencySnapshot;
+      _rangeProxyConcurrencySubscription = _videoProxyHandle!.concurrencyChanges
+          .listen((snapshot) => rangeProxyConcurrency.value = snapshot);
       if (originalAudio != null && originalAudio.isNotEmpty) {
         _audioProxyHandle = proxy.createSession(
           upstream: Uri.parse(originalAudio),
           trackType: ProxyTrackType.audio,
-          maxConcurrency: concurrency,
+          maxConcurrency: concurrencyLimit,
+          initialConcurrency: initialConcurrency,
           headers: headers,
           onFailure: _onRangeProxyFailure,
         );
@@ -979,7 +1249,12 @@ class VideoDetailController extends GetxController
     _rangeProxyFailOpenInProgress = true;
     _rangeProxyFailOpenUsed = true;
     try {
-      playedTime = plPlayerController.videoPlayerController?.state.position;
+      playedTime = chooseResumePosition(
+        playerPosition:
+            plPlayerController.videoPlayerController?.state.position,
+        lastReportedSeconds: plPlayerController.position.value,
+        previousResumePosition: playedTime,
+      );
       await _closeRangeProxyHandles();
       if (!isClosed) await playerInit();
     } finally {
@@ -988,6 +1263,10 @@ class VideoDetailController extends GetxController
   }
 
   Future<void> _closeRangeProxyHandles() async {
+    final subscription = _rangeProxyConcurrencySubscription;
+    _rangeProxyConcurrencySubscription = null;
+    await subscription?.cancel();
+    rangeProxyConcurrency.value = const RangeConcurrencySnapshot(0, 0);
     final video = _videoProxyHandle;
     final audio = _audioProxyHandle;
     _videoProxyHandle = null;
@@ -1463,6 +1742,13 @@ class VideoDetailController extends GetxController
   @override
   void onClose() {
     _stallTimer?.cancel();
+    _frameMonitorTimer?.cancel();
+    if (_rangeProxyConcurrencySubscription != null) {
+      unawaited(_rangeProxyConcurrencySubscription!.cancel());
+      _rangeProxyConcurrencySubscription = null;
+    }
+    _probeCancellation?.cancel();
+    SmartDialog.dismiss(tag: 'cdn-switch-suggestion');
     _stallWorker?.dispose();
     _networkErrorWorker?.dispose();
     unawaited(_closeRangeProxyHandles());
@@ -1495,7 +1781,9 @@ class VideoDetailController extends GetxController
     videoUrl = null;
     audioUrl = null;
     _playbackRoutes = null;
-    _stallRecoveryExhausted = false;
+    _frameStallDetector.reset();
+    _probeCancellation?.cancel();
+    _stallPromptSuppressed = false;
     _rangeProxyFailOpenUsed = false;
     unawaited(_closeRangeProxyHandles());
 
