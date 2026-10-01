@@ -1,6 +1,6 @@
 # PiliPlus overseas playback experiment
 
-This is my public testing fork of [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus), currently based on upstream **2.1.5**. I am still using and testing it myself. Others with similar needs are welcome to try it. The complete acceleration/CDN feature set is not being submitted for upstream inclusion and does not represent the upstream author's roadmap.
+This is my public testing fork of [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus), currently based on upstream **2.1.5**. I am still using and testing it myself. Others with similar needs are welcome to try it.
 
 ## Download the Android test build
 
@@ -26,7 +26,7 @@ The goal is smoother viewing and an open experiment for people with similar need
 
 More requests, probing and retries may use more data, battery and memory, increase heat, or trigger CDN throttling. Mobile networks consume mobile data too. Lower the ceiling or disable acceleration when unnecessary.
 
-Player code in this APK is from `7a613b60f70d869427e91f0626415138b6eb468d`; the release tag additionally includes documentation. Before packaging, **78 tests passed**, analysis had no errors/warnings (38 info diagnostics), and Android debug build/signature checks passed. Long-term device stability remains under testing, including audio-playing/video-frozen cases.
+I am also still testing it.
 
 Please report issues in [this fork](https://github.com/zingnan527/PiliPlus/issues), with app/device/Android versions, region/ISP, network type, video ID/time, CDN hostname, concurrency/ceiling and switching mode. Remove credentials, signed playback URLs and personal IPs from logs.
 
