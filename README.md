@@ -1,3 +1,43 @@
+# PiliPlus 海外播放实验版
+
+这是我基于 [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) 维护的个人公开测试分支，当前基于上游 **2.1.5**。我会自己继续使用、测试和调整；有兴趣的朋友也可以下载试用。完整的加速与 CDN 控制功能暂不向上游提交合入请求，也不代表原作者的开发计划。
+
+## 下载 Android 测试版
+
+**[直接下载 APK（约 137 MiB）](https://github.com/zingnan527/PiliPlus/releases/download/v2.1.5-overseas-test.20261001/v2.1.5-overseas-test.20261001-android-debug.apk)** · [发布说明与校验文件](https://github.com/zingnan527/PiliPlus/releases/tag/v2.1.5-overseas-test.20261001) · [全部测试版本](https://github.com/zingnan527/PiliPlus/releases)
+
+这是 **Android debug 预发布测试包**，不是稳定版。包名为 `com.example.piliplus.debug`，支持 arm64-v8a、armeabi-v7a 和 x86_64，最低 Android 7.0。它通常与原版独立安装；只有包名、签名一致的本分支旧测试包才能覆盖更新。安装其他作者的包时不要为了覆盖而卸载原版，先备份设置。
+
+## 为什么做这个版本
+
+这个版本受到我之前使用的 [Bilibili 线程撕裂者](https://github.com/MrTangLuyao/Bilibili-thread-ripper) 的启发：把视频拆成多个字节范围并发加载，让播放少受单连接速度限制。
+
+我目前人在海外，稳定地连接国内视频 CDN 的网络环境很难得。在我的实际使用中，不同视频的 CDN 表现经常不一样：有的节点能顺畅打开这个视频，换一个视频又会慢下来；冷门视频尤其容易遇到加载慢或播放卡顿。我经常需要测速、尝试不同的 CDN、重新切换线路，所以想把这些操作和并发加载的控制直接放进手机播放器里，才有了这个版本。
+
+目标很简单：让自己看视频尽量少卡顿，并把试验过程公开给有相同需求的人。实际效果取决于所在地区、运营商、视频资源、CDN 和设备，暂时不承诺某个加速比例，也不保证所有卡顿都能解决。
+
+## 怎么用、和原版有什么不同
+
+- 在视频设置中打开 **「实验性 Range 并发加速」**，该功能默认关闭。当前是对选定的同一 CDN 做分片并发读取，不是同时混用多个 CDN。
+- 播放器控制栏里，热点曲线左侧的 **云朵 + 数字** 是 CDN 入口。数字实时显示当前视频的活跃分片请求数，不是配置上限，也不是系统线程总数。
+- 点开后可看当前 CDN、测速列表，手动选线路，调整 **1–128 路**并发上限，并选择 **自动 / 手动确认 / 关闭** CDN 切换。默认上限 64，实际请求数由调度器控制，上限调整在下次加载时生效。
+- 两处设置入口共用配置。显示 0 路可能是已有缓冲、当前没有分片请求，或已回退原生播放；请同时看面板里的加速状态。
+- 切换线路前保存播放位置，重载时从该位置打开。对旧重载和网络重试加入失效检查与串行保护，减少旧任务覆盖新线路的竞态。
+
+提高并发、CDN 测速和重试可能增加流量、耗电、发热和内存占用，也可能触发 CDN 限流。移动网络下同样会消耗移动数据；没有必要时关闭加速或降低上限。
+
+## 测试状态与反馈
+
+此包的播放器代码来自 `7a613b60f70d869427e91f0626415138b6eb468d`；发布标签在此基础上补充项目说明。打包前全量 **78 项测试通过**，静态分析没有错误或警告（有 38 条 info 提示），Android debug 构建和签名校验通过。新版本的真机长期稳定性仍在测试，音频正常但画面冻结等问题不能据此宣布完全解决。
+
+欢迎在 [本仓库 Issues](https://github.com/zingnan527/PiliPlus/issues) 反馈：软件版本、机型和 Android 版本、地区/运营商、Wi-Fi 或移动网络、视频 BV 号和卡顿位置、CDN 主机名、实际并发/上限、切换模式。分享日志前请删除 Cookie、账号凭据、签名播放链接、个人 IP 等敏感信息。
+
+感谢 PiliPlus 原作者及相关开源项目。保留原项目 [GPL-3.0 许可证](LICENSE)，参考项目及授权说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。英文说明见 [README.en.md](README.en.md)。
+
+---
+
+以下保留上游项目介绍；其中的跨平台功能不代表本分支已经发布或验证了对应平台的加速构建。
+
 <div align="center">
     <img width="200" height="200" src="assets/images/logo/logo.png">
 </div>
@@ -215,7 +255,7 @@
 
 ## 下载
 
-可以从 [Releases](https://github.com/bggRGjQaUbCoE/PiliPlus/releases) 下载，或克隆仓库拉取代码后在本地编译。
+本分支 Android 实验版请使用本文顶部的下载入口或 [个人仓库 Releases](https://github.com/zingnan527/PiliPlus/releases)。原版 PiliPlus 请从 [上游 Releases](https://github.com/bggRGjQaUbCoE/PiliPlus/releases) 下载。源码可从本仓库公开测试分支获取。
 
 <br/>
 
