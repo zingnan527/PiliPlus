@@ -57,6 +57,7 @@ import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
 import 'package:PiliPlus/services/playback_acceleration/loopback_range_proxy.dart';
+import 'package:PiliPlus/services/playback_acceleration/playback_reload_guard.dart';
 import 'package:PiliPlus/services/playback_acceleration/frame_stall_detector.dart';
 import 'package:PiliPlus/services/playback_acceleration/byte_range.dart';
 import 'package:PiliPlus/services/playback_acceleration/range_fetcher.dart';
@@ -169,6 +170,14 @@ class VideoDetailController extends GetxController
 
   bool _rangeProxyFailOpenUsed = false;
   bool _rangeProxyFailOpenInProgress = false;
+  final _playbackReloadGuard = PlaybackReloadGuard();
+
+  void _invalidatePlaybackReload() {
+    _playbackReloadGuard.invalidate();
+    _rangeProxyFailOpenInProgress = false;
+    _isStallReloading = false;
+  }
+
   Duration? defaultST;
   Duration? playedTime;
   String playedTimePos(bool hasParams) {
@@ -710,6 +719,8 @@ class VideoDetailController extends GetxController
   ) async {
     if (isClosed || _isStallReloading || _playbackRoutes != routes) return;
     if (!routes.selectVideo(recommendation.targetUrl)) return;
+    _invalidatePlaybackReload();
+    final generation = _playbackReloadGuard.generation;
 
     Duration? audioPosition;
     if (_frameStallDetector.isFrozen) {
@@ -730,18 +741,27 @@ class VideoDetailController extends GetxController
       previousResumePosition: playedTime,
     );
     _frameStallDetector.reset();
+    defaultST = null;
     playedTime = resumePosition;
     videoUrl = routes.videoUrl;
     _isStallReloading = true;
     try {
       await playerInit();
-      if (resumePosition > Duration.zero) {
-        await plPlayerController.seekTo(resumePosition, isSeek: false);
+      if (!_playbackReloadGuard.isCurrent(generation) ||
+          isClosed ||
+          _playbackRoutes != routes) {
+        return;
       }
+      // setDataSource opens Media(start: seek), so no separate stale seek can
+      // race with a subsequent CDN/video reload.
       SmartDialog.showToast('已切换至 ${Uri.parse(routes.videoUrl).host}');
     } finally {
-      _isStallReloading = false;
-      if (!plPlayerController.isBuffering.value) _stallPromptSuppressed = false;
+      if (_playbackReloadGuard.isCurrent(generation)) {
+        _isStallReloading = false;
+        if (!plPlayerController.isBuffering.value) {
+          _stallPromptSuppressed = false;
+        }
+      }
     }
   }
 
@@ -753,6 +773,8 @@ class VideoDetailController extends GetxController
   /// Select a CDN manually without dropping the current playback position.
   Future<void> selectCdnService(CDNService service) async {
     if (isClosed || isFileSource || isQuerying) return;
+    _invalidatePlaybackReload();
+    final generation = _playbackReloadGuard.generation;
     playedTime = chooseResumePosition(
       playerPosition: plPlayerController.videoPlayerController?.state.position,
       lastReportedSeconds: plPlayerController.position.value,
@@ -762,6 +784,7 @@ class VideoDetailController extends GetxController
     _autoPlay.value = true;
     VideoUtils.cdnService = service;
     await setting.put(SettingBoxKey.CDNService, service.name);
+    if (isClosed || !_playbackReloadGuard.isCurrent(generation)) return;
     SmartDialog.showToast('已设置为 ${service.desc}，正在从当前进度重载');
     await queryVideoUrl(fromReset: true);
   }
@@ -770,6 +793,7 @@ class VideoDetailController extends GetxController
     required Iterable<String> videoUrls,
     Iterable<String> audioUrls = const [],
   }) {
+    _invalidatePlaybackReload();
     final routes = VideoUtils.createPlaybackRouteSession(
       videoUrls: videoUrls,
       audioUrls: audioUrls,
@@ -1119,10 +1143,13 @@ class VideoDetailController extends GetxController
     bool? autoplay,
     bool autoFullScreenFlag = false,
   }) async {
+    if (isClosed || (!isFileSource && videoUrl == null)) return;
+    final generation = _playbackReloadGuard.generation;
     Duration? seek = defaultST ?? playedTime;
     if (seek == .zero) seek = null;
     seek ??= getFirstSegment();
     final playbackUrls = isFileSource ? null : await _resolvePlaybackUrls();
+    if (isClosed || !_playbackReloadGuard.isCurrent(generation)) return;
     final resolvedVideoUrl = playbackUrls?.$1 ?? videoUrl;
     final resolvedAudioUrl = playbackUrls?.$2 ?? audioUrl;
     await plPlayerController.setDataSource(
@@ -1151,6 +1178,7 @@ class VideoDetailController extends GetxController
       pgcType: isUgc ? null : pgcType,
       videoType: videoType,
       onInit: () {
+        if (isClosed || !_playbackReloadGuard.isCurrent(generation)) return;
         videoState.value = true;
         setSubtitle(vttSubtitlesIndex.value);
       },
@@ -1158,9 +1186,10 @@ class VideoDetailController extends GetxController
       height: firstVideo.height,
       volume: volume,
       autoFullScreenFlag: autoFullScreenFlag,
+      isCurrent: () => !isClosed && _playbackReloadGuard.isCurrent(generation),
     );
 
-    if (isClosed) return;
+    if (isClosed || !_playbackReloadGuard.isCurrent(generation)) return;
 
     if (!isFileSource) {
       if (plPlayerController.enableBlock) {
@@ -1182,6 +1211,7 @@ class VideoDetailController extends GetxController
   Future<(String, String?)> _resolvePlaybackUrls() async {
     final originalVideo = videoUrl!;
     final originalAudio = audioUrl;
+    final generation = _playbackReloadGuard.generation;
     if (!Pref.rangeProxyAcceleration || _rangeProxyFailOpenUsed) {
       return (originalVideo, originalAudio);
     }
@@ -1191,11 +1221,20 @@ class VideoDetailController extends GetxController
         globalMaxConcurrency: concurrencyLimit,
       );
       await proxy.start();
+      if (isClosed || !_playbackReloadGuard.isCurrent(generation)) {
+        return (originalVideo, originalAudio);
+      }
       await _closeRangeProxyHandles();
+      if (isClosed || !_playbackReloadGuard.isCurrent(generation)) {
+        return (originalVideo, originalAudio);
+      }
       final initialConcurrency = recommendedRangeProxyConcurrency(
         isWifi: await ConnectivityUtils.isWiFi,
         maxConcurrency: concurrencyLimit,
       );
+      if (isClosed || !_playbackReloadGuard.isCurrent(generation)) {
+        return (originalVideo, originalAudio);
+      }
       final headers = <String, String>{
         'user-agent': BrowserUa.pc,
         'referer': 'https://www.bilibili.com',
@@ -1206,7 +1245,11 @@ class VideoDetailController extends GetxController
         maxConcurrency: concurrencyLimit,
         initialConcurrency: initialConcurrency,
         headers: headers,
-        onFailure: _onRangeProxyFailure,
+        onFailure: (failure) {
+          if (_playbackReloadGuard.isCurrent(generation)) {
+            _onRangeProxyFailure(failure);
+          }
+        },
       );
       rangeProxyConcurrency.value = _videoProxyHandle!.concurrencySnapshot;
       _rangeProxyConcurrencySubscription = _videoProxyHandle!.concurrencyChanges
@@ -1218,7 +1261,11 @@ class VideoDetailController extends GetxController
           maxConcurrency: concurrencyLimit,
           initialConcurrency: initialConcurrency,
           headers: headers,
-          onFailure: _onRangeProxyFailure,
+          onFailure: (failure) {
+            if (_playbackReloadGuard.isCurrent(generation)) {
+              _onRangeProxyFailure(failure);
+            }
+          },
         );
       }
       return (
@@ -1226,8 +1273,10 @@ class VideoDetailController extends GetxController
         _audioProxyHandle?.localUri.toString(),
       );
     } catch (_) {
-      _rangeProxyFailOpenUsed = true;
-      await _closeRangeProxyHandles();
+      if (_playbackReloadGuard.isCurrent(generation)) {
+        _rangeProxyFailOpenUsed = true;
+        await _closeRangeProxyHandles();
+      }
       return (originalVideo, originalAudio);
     }
   }
@@ -1246,6 +1295,8 @@ class VideoDetailController extends GetxController
 
   Future<void> _failOpenRangeProxy() async {
     if (_rangeProxyFailOpenInProgress || _rangeProxyFailOpenUsed) return;
+    final generation = _playbackReloadGuard.generation;
+    final routes = _playbackRoutes;
     _rangeProxyFailOpenInProgress = true;
     _rangeProxyFailOpenUsed = true;
     try {
@@ -1255,22 +1306,28 @@ class VideoDetailController extends GetxController
         lastReportedSeconds: plPlayerController.position.value,
         previousResumePosition: playedTime,
       );
-      await _closeRangeProxyHandles();
-      if (!isClosed) await playerInit();
+      await _playbackReloadGuard.run(
+        prepare: _closeRangeProxyHandles,
+        isPlaybackCurrent: () =>
+            !isClosed && videoUrl != null && _playbackRoutes == routes,
+        reload: playerInit,
+      );
     } finally {
-      _rangeProxyFailOpenInProgress = false;
+      if (_playbackReloadGuard.isCurrent(generation)) {
+        _rangeProxyFailOpenInProgress = false;
+      }
     }
   }
 
   Future<void> _closeRangeProxyHandles() async {
     final subscription = _rangeProxyConcurrencySubscription;
-    _rangeProxyConcurrencySubscription = null;
-    await subscription?.cancel();
-    rangeProxyConcurrency.value = const RangeConcurrencySnapshot(0, 0);
     final video = _videoProxyHandle;
     final audio = _audioProxyHandle;
+    _rangeProxyConcurrencySubscription = null;
     _videoProxyHandle = null;
     _audioProxyHandle = null;
+    rangeProxyConcurrency.value = const RangeConcurrencySnapshot(0, 0);
+    await subscription?.cancel();
     await video?.close();
     await audio?.close();
   }
@@ -1326,6 +1383,7 @@ class VideoDetailController extends GetxController
     if (isQuerying) {
       return;
     }
+    _invalidatePlaybackReload();
     isQuerying = true;
     try {
       await _queryVideoUrl(fromReset, autoFullScreenFlag);
@@ -1741,6 +1799,7 @@ class VideoDetailController extends GetxController
 
   @override
   void onClose() {
+    _invalidatePlaybackReload();
     _stallTimer?.cancel();
     _frameMonitorTimer?.cancel();
     if (_rangeProxyConcurrencySubscription != null) {
@@ -1772,6 +1831,7 @@ class VideoDetailController extends GetxController
   }
 
   void onReset({bool isStein = false}) {
+    _invalidatePlaybackReload();
     if (isFileSource) {
       cacheLocalProgress();
     }

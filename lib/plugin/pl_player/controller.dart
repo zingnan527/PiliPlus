@@ -29,6 +29,7 @@ import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/services/service_locator.dart';
+import 'package:PiliPlus/services/playback_acceleration/playback_reload_guard.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/android/bindings.g.dart';
@@ -577,6 +578,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   bool _processing = false;
+  final _dataSourceReloads = PlaybackReloadQueue();
   bool get processing => _processing;
 
   // offline
@@ -607,74 +609,78 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     VoidCallback? onInit,
     Volume? volume,
     bool autoFullScreenFlag = false,
-  }) async {
-    try {
-      _processing = true;
-      this.isLive = isLive;
-      _videoType = videoType ?? VideoType.ugc;
-      this.width = width;
-      this.height = height;
-      if (dataSource case NetworkSource(:final videoSource)
-          when videoSource != _networkRetrySource) {
-        _networkRetrySource = videoSource;
-        _networkOpenRetryUsed = false;
-      }
-      this.dataSource = dataSource;
-      _autoPlay = autoplay;
-      // 初始化数据加载状态
-      dataStatus.value = DataStatus.loading;
-      // 初始化全屏方向
-      _isVertical = isVertical ?? false;
-      _aid = aid;
-      _bvid = bvid;
-      this.cid = cid;
-      _epid = epid;
-      _seasonId = seasonId;
-      _pgcType = pgcType;
+    bool Function()? isCurrent,
+  }) {
+    return _dataSourceReloads.run(() async {
+      try {
+        _cancelSubForSeek();
+        _processing = true;
+        this.isLive = isLive;
+        _videoType = videoType ?? VideoType.ugc;
+        this.width = width;
+        this.height = height;
+        if (dataSource case NetworkSource(:final videoSource)
+            when videoSource != _networkRetrySource) {
+          _networkRetrySource = videoSource;
+          _networkOpenRetryUsed = false;
+        }
+        this.dataSource = dataSource;
+        _autoPlay = autoplay;
+        // 初始化数据加载状态
+        dataStatus.value = DataStatus.loading;
+        // 初始化全屏方向
+        _isVertical = isVertical ?? false;
+        _aid = aid;
+        _bvid = bvid;
+        this.cid = cid;
+        _epid = epid;
+        _seasonId = seasonId;
+        _pgcType = pgcType;
 
-      if (showSeekPreview) {
-        _clearPreview();
-      }
-      cancelLongPressTimer();
-      if (_videoPlayerController != null &&
-          _videoPlayerController!.state.playing) {
-        await pause(notify: false);
-      }
+        if (showSeekPreview) {
+          _clearPreview();
+        }
+        cancelLongPressTimer();
+        if (_videoPlayerController != null &&
+            _videoPlayerController!.state.playing) {
+          await pause(notify: false);
+        }
 
-      if (_playerCount == 0) {
-        return;
+        if (_playerCount == 0) {
+          return;
+        }
+        // 配置Player 音轨、字幕等等
+        await _createVideoController(dataSource, seekTo, volume);
+
+        if (_playerCount == 0) {
+          _removeListeners();
+          _videoPlayerController?.dispose();
+          _videoPlayerController = null;
+          _videoController = null;
+          return;
+        }
+
+        updateDuration(duration ?? _videoPlayerController!.state.duration);
+        position.value = buffered.value = seekTo?.inSeconds ?? 0;
+
+        dataStatus.value = .loaded;
+
+        if (autoFullScreenFlag && autoEnterFullScreen) {
+          triggerFullScreen(status: true);
+        }
+
+        await _initializePlayer();
+        onInit?.call();
+      } catch (err, stackTrace) {
+        dataStatus.value = DataStatus.error;
+        if (kDebugMode) {
+          debugPrint(stackTrace.toString());
+          debugPrint('plPlayer err:  $err');
+        }
+      } finally {
+        _processing = false;
       }
-      // 配置Player 音轨、字幕等等
-      await _createVideoController(dataSource, seekTo, volume);
-
-      if (_playerCount == 0) {
-        _removeListeners();
-        _videoPlayerController?.dispose();
-        _videoPlayerController = null;
-        _videoController = null;
-        return;
-      }
-
-      updateDuration(duration ?? _videoPlayerController!.state.duration);
-      position.value = buffered.value = seekTo?.inSeconds ?? 0;
-
-      dataStatus.value = .loaded;
-
-      if (autoFullScreenFlag && autoEnterFullScreen) {
-        triggerFullScreen(status: true);
-      }
-
-      await _initializePlayer();
-      onInit?.call();
-    } catch (err, stackTrace) {
-      dataStatus.value = DataStatus.error;
-      if (kDebugMode) {
-        debugPrint(stackTrace.toString());
-        debugPrint('plPlayer err:  $err');
-      }
-    } finally {
-      _processing = false;
-    }
+    }, isCurrent: isCurrent);
   }
 
   String? shadersDirPath;
@@ -891,11 +897,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void _updatePlaybackState({Duration? position, String? debugLabel}) {
+    final currentPosition = position ?? _videoPlayerController?.state.position;
+    if (currentPosition == null) return;
     videoPlayerServiceHandler?.onUpdateState(
       playerStatus,
       isBuffering.value,
       isLive,
-      position: position ?? _videoPlayerController!.state.position,
+      position: currentPosition,
       speed: playbackSpeed,
       debugLabel: debugLabel,
     );
